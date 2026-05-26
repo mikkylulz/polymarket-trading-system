@@ -1,0 +1,21 @@
+# Credentials — NEVER commit
+.env
+
+# Runtime data
+data/
+state.json
+calibration.json
+learning.json
+btc_5m_trades.json
+
+# Logs and cache
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.sixth/
+.claude/
+
+# Editor
+.vscode/
+*.swp
