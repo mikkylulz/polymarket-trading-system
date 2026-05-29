@@ -7,10 +7,10 @@ from config import (ACTIVE_CITIES, SCAN_INTERVAL, PAPER_MODE,
 from state import send_alert, load_calibration
 from scanner import scan_and_update, clear_stale_positions, drain_priority_queue
 from learning import print_learn_report
-from crypto_scanner import run_crypto_scan
+from crypto_scanner import run_crypto_scan, run_sol_scan, monitor_btc_open_trades
 
-CRYPTO_SCAN_INTERVAL   = 240  # 4 minutes
-PRIORITY_CHECK_INTERVAL = 60   # seconds between priority-queue polls during sleep
+CRYPTO_SCAN_INTERVAL   = 120  # 2 minutes
+PRIORITY_CHECK_INTERVAL = 30   # seconds between priority-queue polls during sleep
 
 log = logging.getLogger("weatherbet")
 
@@ -88,6 +88,60 @@ def print_status():
           f"   (conv ${conv_pnl:+.2f}  btc ${btc_pnl:+.2f})")
     print(f"{'='*60}")
 
+def _btc_edge_table(trades):
+    from datetime import datetime, timezone
+
+    # ── Edge by entry price ───────────────────────────────────
+    buckets = [
+        ("0-30¢",   0.00, 0.30, 15.0),
+        ("30-50¢",  0.30, 0.50, 40.0),
+        ("50-65¢",  0.50, 0.65, 57.5),
+    ]
+    print(f"  BTC EDGE BY ENTRY PRICE")
+    print(f"  {'Bucket':10} {'Trades':>6}  {'Actual WR':>9}  {'Break-even':>10}  {'Edge':>8}")
+    print(f"  {'-'*50}")
+    for label, lo, hi, be in buckets:
+        b = [t for t in trades if lo <= (t.get("entry_price") or 0) < hi]
+        if not b:
+            continue
+        wr   = sum(1 for t in b if t["won"]) / len(b) * 100
+        edge = wr - be
+        sign = "+" if edge >= 0 else ""
+        print(f"  {label:10} {len(b):>6}  {wr:>8.1f}%  {be:>9.1f}%  {sign}{edge:.1f}%")
+    print()
+
+    # ── Time-to-entry stats ───────────────────────────────────
+    def _tte(t):
+        try:
+            o = datetime.fromisoformat(t["opened_at"])
+            m = datetime.fromisoformat(t["market_open_at"])
+            return max(0, (o - m).total_seconds())
+        except Exception:
+            return None
+
+    timed = [(t, _tte(t)) for t in trades if _tte(t) is not None]
+    if timed:
+        avg_tte = sum(s for _, s in timed) / len(timed)
+        print(f"  Avg time to entry : {avg_tte/60:.1f} min after market open  "
+              f"({len(timed)}/{len(trades)} trades have timing data)")
+
+        timing_buckets = [
+            ("0–15 min",  0,    900),
+            ("15–30 min", 900,  1800),
+            ("30+ min",   1800, 9999),
+        ]
+        print(f"\n  WIN RATE BY ENTRY TIMING")
+        print(f"  {'Window':12} {'Trades':>6}  {'Win Rate':>9}")
+        print(f"  {'-'*32}")
+        for label, lo, hi in timing_buckets:
+            b = [t for t, s in timed if lo <= s < hi]
+            if not b:
+                continue
+            wr = sum(1 for t in b if t["won"]) / len(b) * 100
+            print(f"  {label:12} {len(b):>6}  {wr:>8.1f}%")
+        print()
+
+
 def print_report():
     import json
     from config import MARKETS_DIR
@@ -134,8 +188,14 @@ def print_report():
     print(f"  GRAND TOTAL : ${grand_total:+.2f}")
     print(f"{'='*75}\n")
 
+    if btc_settled:
+        _btc_edge_table(btc_all)
+
 def _in_rapid_window():
     return RAPID_START_UTC <= datetime.now(timezone.utc).hour < RAPID_END_UTC
+
+def _in_pause_window():
+    return False  # pause disabled — re-enable when needed
 
 # ── Entry point ──────────────────────────────────────────────
 if __name__ == "__main__":
@@ -147,6 +207,16 @@ if __name__ == "__main__":
         print_report()
     elif arg == "learn":
         print_learn_report()
+    elif arg == "btc-clear-halt":
+        from crypto_scanner import BTC_TRADES_FILE
+        import json as _json
+        if BTC_TRADES_FILE.exists():
+            store = _json.loads(BTC_TRADES_FILE.read_text())
+            store["halt_until"] = None
+            BTC_TRADES_FILE.write_text(_json.dumps(store, indent=2))
+            print("BTC loss-streak halt cleared.")
+        else:
+            print("No BTC trades file found.")
     elif arg == "scan":
         scan_and_update()
     elif arg == "reset":
@@ -164,42 +234,39 @@ if __name__ == "__main__":
     else:
         clear_stale_positions()
 
-        mode     = "PAPER" if PAPER_MODE else "LIVE"
-        btc_mode = "LIVE"  if BTC_LIVE_MODE else "PAPER"
-        log.info(f"WeatherBet Ultimate starting -- {mode} MODE")
+        btc_mode = "LIVE" if BTC_LIVE_MODE else "PAPER"
+        log.info(f"WeatherBet Ultimate starting -- BTC-ONLY MODE (weather paused)")
         log.info(f"[BTC] Mode: {btc_mode}")
-        log.info(f"Cities: {', '.join(ACTIVE_CITIES)}")
-        log.info(f"Rapid window: {RAPID_START_UTC:02d}:00-{RAPID_END_UTC:02d}:00 UTC "
-                 f"({RAPID_SCAN_INTERVAL}s) → {', '.join(RAPID_SCAN_CITIES)}")
         send_alert(
-            f"WeatherBot Ultimate started -- {mode}\n"
-            f"BTC Scanner: {btc_mode}\n"
-            f"Cities: {', '.join(ACTIVE_CITIES)}"
+            f"WeatherBot started — BTC-ONLY MODE\n"
+            f"Weather scanner: PAUSED\n"
+            f"BTC Scanner: {btc_mode}"
         )
+
+        WEATHER_PAUSED = True   # weather scanner paused — BTC only mode
 
         stopped     = False
         last_crypto = time.monotonic()   # global BTC cadence — never reset by weather cycle
         while not stopped:
-            rapid = _in_rapid_window()
-            try:
-                if rapid:
-                    scan_and_update(city_filter=RAPID_SCAN_CITIES)
-                else:
-                    scan_and_update()
-            except KeyboardInterrupt:
-                log.info("Stopped.")
-                stopped = True
-                break
-            except Exception as e:
-                log.error(f"Scan error: {e}", exc_info=True)
-                send_alert(f"Scan error: {e}", priority="high")
+            if not WEATHER_PAUSED:
+                rapid = _in_rapid_window()
+                try:
+                    if rapid:
+                        scan_and_update(city_filter=RAPID_SCAN_CITIES)
+                    else:
+                        scan_and_update()
+                except KeyboardInterrupt:
+                    log.info("Stopped.")
+                    stopped = True
+                    break
+                except Exception as e:
+                    log.error(f"Scan error: {e}", exc_info=True)
+                    send_alert(f"Scan error: {e}", priority="high")
 
-            # Sleep until next weather scan.
-            # Wake every PRIORITY_CHECK_INTERVAL (60s) to drain the BIG MOVE
-            # priority queue and run the BTC scanner on its own 240s cadence.
-            weather_sleep = RAPID_SCAN_INTERVAL if rapid else SCAN_INTERVAL
-            tag           = "[RAPID]" if rapid else "[NORMAL]"
-            deadline      = time.monotonic() + weather_sleep
+            # Sleep loop: runs BTC scanner every 240s and drains priority queue.
+            # When weather is paused the outer loop just re-enters the sleep immediately.
+            sleep_interval = CRYPTO_SCAN_INTERVAL   # reuse the BTC cadence as the outer tick
+            deadline       = time.monotonic() + sleep_interval
 
             while not stopped:
                 remaining = deadline - time.monotonic()
@@ -207,7 +274,7 @@ if __name__ == "__main__":
                     break
 
                 chunk = min(PRIORITY_CHECK_INTERVAL, remaining)
-                log.info(f"{tag} Next weather scan in {remaining:.0f}s "
+                log.info(f"[BTC-ONLY] Next BTC scan in {remaining:.0f}s "
                          f"— sleeping {chunk:.0f}s")
                 try:
                     time.sleep(chunk)
@@ -222,13 +289,29 @@ if __name__ == "__main__":
                 except Exception as e:
                     log.error(f"Priority queue drain error: {e}", exc_info=True)
 
-                # BTC scanner: independent 240s cadence
+                # Mid-trade monitor: check open BTC positions every 30s
+                try:
+                    monitor_btc_open_trades()
+                except Exception as e:
+                    log.error(f"Mid-trade monitor error: {e}", exc_info=True)
+
+                # BTC scanner: independent 240s cadence — skip during pause window
                 if time.monotonic() - last_crypto >= CRYPTO_SCAN_INTERVAL:
-                    try:
-                        run_crypto_scan()
-                    except KeyboardInterrupt:
-                        log.info("Stopped.")
-                        stopped = True
-                    except Exception as e:
-                        log.error(f"Crypto scan error: {e}", exc_info=True)
+                    if _in_pause_window():
+                        log.info("[PAUSE] 00:00-05:00 UTC — BTC scan suppressed")
+                    else:
+                        try:
+                            run_crypto_scan()
+                        except KeyboardInterrupt:
+                            log.info("Stopped.")
+                            stopped = True
+                        except Exception as e:
+                            log.error(f"Crypto scan error: {e}", exc_info=True)
+                        try:
+                            run_sol_scan()
+                        except KeyboardInterrupt:
+                            log.info("Stopped.")
+                            stopped = True
+                        except Exception as e:
+                            log.error(f"SOL scan error: {e}", exc_info=True)
                     last_crypto = time.monotonic()

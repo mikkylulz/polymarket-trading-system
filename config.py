@@ -65,6 +65,7 @@ POLY_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE", "")
 PRIVATE_KEY          = os.getenv("PRIVATE_KEY", "")
 POLYMARKET_PROXY_WALLET = os.getenv("POLYMARKET_PROXY_WALLET", "")
 BTC_LIVE_MODE   = os.getenv("BTC_LIVE_MODE", "false").lower() == "true"
+SOL_LIVE_MODE   = os.getenv("SOL_LIVE_MODE", "false").lower() == "true"
 ACTIVE_CITIES       = CFG["active_cities"]
 LIVE_CITIES         = CFG.get("live_cities", CFG["active_cities"])
 RAPID_SCAN_CITIES   = CFG.get("rapid_scan_cities", ["hong_kong", "singapore", "tokyo", "seoul", "chengdu"])
