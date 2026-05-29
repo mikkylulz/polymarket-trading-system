@@ -17,7 +17,7 @@ log = logging.getLogger("weatherbet")
 # ── Reports ──────────────────────────────────────────────────
 def print_status():
     import json
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     from config import PAPER_MODE, MARKETS_DIR
 
     # ── Conviction trades (market files) ─────────────────────
@@ -60,44 +60,88 @@ def print_status():
                   f"${pos['size']:.2f} | Forecast: {snap.get('best_temp', '?')}C")
 
     # ── BTC 5m trades (learning.json) ────────────────────────
-    btc_pnl = 0.0
+    btc_pnl = btc_wr7 = btc_wr30 = btc_wr_all = None
     btc_settled = btc_wins = 0
+    btc_kelly = 1.0
     try:
         from learning import load_learning
-        btc_data = load_learning().get("btc_5m", {})
-        btc_all  = [t for t in btc_data.get("trades", []) if t.get("won") is not None]
+        btc_data    = load_learning().get("btc_5m", {})
+        btc_all     = [t for t in btc_data.get("trades", []) if t.get("won") is not None]
         btc_settled = len(btc_all)
         btc_wins    = sum(1 for t in btc_all if t["won"])
         btc_pnl     = sum(t.get("pnl") or 0 for t in btc_all)
+        btc_kelly   = btc_data.get("kelly_multiplier", 1.0)
+        wrs         = btc_data.get("win_rates", {})
+        btc_wr7     = wrs.get("7d")
+        btc_wr30    = wrs.get("30d")
+        btc_wr_all  = wrs.get("all")
     except Exception:
         pass
 
+    btc_pnl = btc_pnl or 0.0
     print(f"\n  BTC 5-MINUTE")
     print(f"  {'─'*56}")
     if btc_settled:
-        btc_wr = btc_wins / btc_settled * 100
-        print(f"  Settled       : {btc_settled}  |  {btc_wins} wins  |  Win rate: {btc_wr:.1f}%")
+        btc_losses = btc_settled - btc_wins
+        all_str = f"{btc_wr_all*100:.1f}%" if btc_wr_all is not None else "n/a"
+        wr7_str  = f"{btc_wr7*100:.1f}%"  if btc_wr7  is not None else "n/a"
+        wr30_str = f"{btc_wr30*100:.1f}%" if btc_wr30 is not None else "n/a"
+        print(f"  Settled       : {btc_settled}  |  {btc_wins}W {btc_losses}L  |  All WR: {all_str}")
+        print(f"  Win rate      : 7d {wr7_str}  |  30d {wr30_str}  |  Kelly: {btc_kelly:.1f}x")
         print(f"  BTC P&L       : ${btc_pnl:+.2f}")
     else:
         print(f"  BTC P&L       : n/a  (no settled trades yet)")
 
+    # ── SOL 5m trades (sol_5m_trades.json) ───────────────────
+    sol_pnl = 0.0
+    sol_settled = sol_wins = 0
+    sol_wr7 = sol_wr30 = sol_wr_all = None
+    sol_kelly = 1.0
+    try:
+        from crypto_scanner import SOL_TRADES_FILE
+        if SOL_TRADES_FILE.exists():
+            store   = json.loads(SOL_TRADES_FILE.read_text())
+            sol_all = [t for t in store.get("trades", []) if t.get("won") is not None]
+            sol_settled = len(sol_all)
+            sol_wins    = sum(1 for t in sol_all if t["won"])
+            sol_pnl     = sum(t.get("pnl") or 0 for t in sol_all)
+            c7d  = (now - timedelta(days=7)).date().isoformat()
+            c30d = (now - timedelta(days=30)).date().isoformat()
+            t7d  = [t for t in sol_all if (t.get("opened_at") or "")[:10] >= c7d]
+            t30d = [t for t in sol_all if (t.get("opened_at") or "")[:10] >= c30d]
+            sol_wr7    = sum(1 for t in t7d  if t["won"]) / len(t7d)  if t7d  else None
+            sol_wr30   = sum(1 for t in t30d if t["won"]) / len(t30d) if t30d else None
+            sol_wr_all = sol_wins / sol_settled if sol_settled else None
+            if sol_wr7 is not None and len(t7d) >= 5:
+                sol_kelly = 0.5 if sol_wr7 < 0.30 else 1.0
+    except Exception:
+        pass
+
+    print(f"\n  SOL 5-MINUTE")
+    print(f"  {'─'*56}")
+    if sol_settled:
+        sol_losses = sol_settled - sol_wins
+        all_str  = f"{sol_wr_all*100:.1f}%" if sol_wr_all is not None else "n/a"
+        wr7_str  = f"{sol_wr7*100:.1f}%"    if sol_wr7   is not None else "n/a"
+        wr30_str = f"{sol_wr30*100:.1f}%"   if sol_wr30  is not None else "n/a"
+        print(f"  Settled       : {sol_settled}  |  {sol_wins}W {sol_losses}L  |  All WR: {all_str}")
+        print(f"  Win rate      : 7d {wr7_str}  |  30d {wr30_str}  |  Kelly: {sol_kelly:.1f}x")
+        print(f"  SOL P&L       : ${sol_pnl:+.2f}")
+    else:
+        print(f"  SOL P&L       : n/a  (no settled trades yet)")
+
     # ── Grand total ───────────────────────────────────────────
-    grand_total = conv_pnl + btc_pnl
+    grand_total = conv_pnl + btc_pnl + sol_pnl
     print(f"\n{'='*60}")
     print(f"  GRAND TOTAL   : ${grand_total:+.2f}"
-          f"   (conv ${conv_pnl:+.2f}  btc ${btc_pnl:+.2f})")
+          f"   (conv ${conv_pnl:+.2f}  btc ${btc_pnl:+.2f}  sol ${sol_pnl:+.2f})")
     print(f"{'='*60}")
 
-def _btc_edge_table(trades):
-    from datetime import datetime, timezone
+def _crypto_edge_table(coin_label: str, trades: list, buckets: list):
+    """Edge-by-price and timing stats for any crypto scanner's settled trades."""
+    from datetime import datetime
 
-    # ── Edge by entry price ───────────────────────────────────
-    buckets = [
-        ("0-30¢",   0.00, 0.30, 15.0),
-        ("30-50¢",  0.30, 0.50, 40.0),
-        ("50-65¢",  0.50, 0.65, 57.5),
-    ]
-    print(f"  BTC EDGE BY ENTRY PRICE")
+    print(f"  {coin_label} EDGE BY ENTRY PRICE")
     print(f"  {'Bucket':10} {'Trades':>6}  {'Actual WR':>9}  {'Break-even':>10}  {'Edge':>8}")
     print(f"  {'-'*50}")
     for label, lo, hi, be in buckets:
@@ -171,6 +215,7 @@ def print_report():
     # ── BTC 5m P&L (learning.json) ───────────────────────────
     btc_pnl = 0.0
     btc_settled = 0
+    btc_all = []
     try:
         from learning import load_learning
         btc_all     = [t for t in load_learning().get("btc_5m", {}).get("trades", [])
@@ -180,16 +225,45 @@ def print_report():
     except Exception:
         pass
 
-    grand_total = total + btc_pnl
+    # ── SOL 5m P&L (sol_5m_trades.json) ──────────────────────
+    sol_pnl = 0.0
+    sol_settled = 0
+    sol_all = []
+    try:
+        from crypto_scanner import SOL_TRADES_FILE
+        if SOL_TRADES_FILE.exists():
+            store       = json.loads(SOL_TRADES_FILE.read_text())
+            sol_all     = [t for t in store.get("trades", []) if t.get("won") is not None]
+            sol_settled = len(sol_all)
+            sol_pnl     = sum(t.get("pnl") or 0 for t in sol_all)
+    except Exception:
+        pass
+
+    grand_total = total + btc_pnl + sol_pnl
     print(f"{'='*75}")
     print(f"  Conviction  : ${total:+.2f}  ({len(all_m)} trades)")
     if btc_settled:
-        print(f"  BTC 5m      : ${btc_pnl:+.2f}  ({btc_settled} settled)")
+        btc_wins = sum(1 for t in btc_all if t["won"])
+        print(f"  BTC 5m      : ${btc_pnl:+.2f}  ({btc_settled} settled  {btc_wins}W {btc_settled-btc_wins}L)")
+    if sol_settled:
+        sol_wins = sum(1 for t in sol_all if t["won"])
+        print(f"  SOL 5m      : ${sol_pnl:+.2f}  ({sol_settled} settled  {sol_wins}W {sol_settled-sol_wins}L)")
     print(f"  GRAND TOTAL : ${grand_total:+.2f}")
     print(f"{'='*75}\n")
 
+    BTC_BUCKETS = [
+        ("0-30¢",  0.00, 0.30, 15.0),
+        ("30-50¢", 0.30, 0.50, 40.0),
+        ("50-65¢", 0.50, 0.65, 57.5),
+    ]
+    SOL_BUCKETS = [
+        ("0-30¢",  0.00, 0.30, 15.0),
+        ("30-50¢", 0.30, 0.50, 40.0),
+    ]
     if btc_settled:
-        _btc_edge_table(btc_all)
+        _crypto_edge_table("BTC", btc_all, BTC_BUCKETS)
+    if sol_settled:
+        _crypto_edge_table("SOL", sol_all, SOL_BUCKETS)
 
 def _in_rapid_window():
     return RAPID_START_UTC <= datetime.now(timezone.utc).hour < RAPID_END_UTC
