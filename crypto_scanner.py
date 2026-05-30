@@ -2080,6 +2080,85 @@ def _find_sol_5m_market() -> Optional[dict]:
     return best
 
 
+# ── SOL live order ────────────────────────────────────────────
+def _sol_live_order(direction: str, market: dict, price: float, size: float) -> str:
+    """Submit a live SOL 5m FOK order via the shared Polymarket CLOB client.
+    Returns order_id on success, empty string on any failure.
+    Reuses _get_clob_client() — same wallet and credentials as BTC.
+    """
+    token_id = (market.get("token_id")
+                if direction == "UP"
+                else market.get("no_token_id"))
+    if not token_id:
+        log.warning(f"[SOL LIVE] No token_id for direction={direction} — skipping")
+        return ""
+
+    client = _get_clob_client()
+    if client is None:
+        return ""
+
+    try:
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+
+        price_r   = round(min(price + 0.03, 0.97), 4)
+        usdc_size = round(size, 2)
+
+        log.info(
+            f"[SOL LIVE] Step 1 — token_id={token_id} "
+            f"signal={price:.4f} limit={price_r} usdc=${usdc_size:.2f} (market FOK)"
+        )
+        order_args = MarketOrderArgsV2(
+            token_id=token_id,
+            amount=usdc_size,
+            side="BUY",
+            price=price_r,
+            order_type=OrderType.FOK,
+        )
+        log.info("[SOL LIVE] Step 2 — calling create_market_order() …")
+        signed_order = client.create_market_order(order_args)
+        log.info("[SOL LIVE] Step 3 — calling post_order() FOK …")
+        resp = client.post_order(signed_order, OrderType.FOK)
+        log.info(f"[SOL LIVE] Step 4 — full response: {resp}")
+    except Exception as e:
+        err_str = str(e)
+        if "fully filled" in err_str or "FOK" in err_str:
+            log.info(f"[SOL LIVE] FOK kill — no liquidity at {round(price, 4)}, trade skipped")
+            return ""
+        log.error(f"[SOL LIVE] Order submission failed: {e}")
+        send_alert(f"[SOL LIVE] LIVE ORDER FAILED: {e}", priority="high")
+        return ""
+
+    if not isinstance(resp, dict):
+        log.error(f"[SOL LIVE] Unexpected response type {type(resp).__name__}: {resp}")
+        send_alert(f"[SOL LIVE] LIVE ORDER FAILED — unexpected response: {resp}",
+                   priority="high")
+        return ""
+
+    order_id  = resp.get("orderID") or resp.get("id") or ""
+    success   = resp.get("success")
+    error_msg = resp.get("errorMsg") or resp.get("error") or ""
+    status    = resp.get("status", "")
+
+    if success is False:
+        reason = error_msg or f"status={status}" or "unknown"
+        log.error(f"[SOL LIVE] ORDER REJECTED — {reason} | resp={resp}")
+        send_alert(f"[SOL LIVE] ORDER REJECTED\n{reason}", priority="high")
+        return ""
+
+    if error_msg:
+        log.error(f"[SOL LIVE] ORDER ERROR — {error_msg} | resp={resp}")
+        send_alert(f"[SOL LIVE] ORDER ERROR\n{error_msg}", priority="high")
+        return ""
+
+    if not order_id and success is not True:
+        log.info(f"[SOL LIVE] FOK unmatched — no liquidity at {price:.4f}, skipping")
+        return ""
+
+    log.info(f"[SOL LIVE] Order CONFIRMED — direction={direction} order_id={order_id} "
+             f"token={token_id[:8]}... price={price:.4f} usdc=${usdc_size:.2f}")
+    return order_id
+
+
 # ── SOL trade lifecycle ───────────────────────────────────────
 def _close_expired_sol_trades(current_sol_price: float):
     trades  = _load_sol_trades()
@@ -2097,10 +2176,38 @@ def _close_expired_sol_trades(current_sol_price: float):
                 remaining = (closes_at - now_utc).total_seconds()
                 log.info(f"SOL trade still open — {remaining:.0f}s remaining")
                 continue
+
             direction = t["direction"]
             sol_entry = t["sol_entry"]
-            won = ((direction == "UP"   and current_sol_price > sol_entry) or
-                   (direction == "DOWN" and current_sol_price < sol_entry))
+
+            if SOL_LIVE_MODE:
+                # Wait for Polymarket oracle before settling
+                mca = t.get("market_closes_at")
+                if mca:
+                    try:
+                        mca_dt = datetime.fromisoformat(mca)
+                        if now_utc < mca_dt:
+                            remaining = (mca_dt - now_utc).total_seconds()
+                            log.info(f"[SOL LIVE] Awaiting Polymarket close in {remaining:.0f}s")
+                            continue
+                    except Exception:
+                        pass
+                yes_token_id = t.get("yes_token_id")
+                if yes_token_id:
+                    yes_won = _query_poly_resolution(yes_token_id)
+                    if yes_won is None:
+                        log.info("[SOL LIVE] Oracle not resolved yet — rechecking next scan")
+                        continue
+                    won = yes_won if direction == "UP" else not yes_won
+                    log.info(f"[SOL LIVE] Oracle resolved: YES={'WON' if yes_won else 'LOST'} "
+                             f"→ trade {'WON' if won else 'LOST'}")
+                else:
+                    won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                           (direction == "DOWN" and current_sol_price < sol_entry))
+            else:
+                won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                       (direction == "DOWN" and current_sol_price < sol_entry))
+
             entry_price = t["entry_price"]
             size        = t["size"]
             pnl = round(size * (1.0 / entry_price - 1.0), 2) if won else -size
@@ -2111,7 +2218,8 @@ def _close_expired_sol_trades(current_sol_price: float):
             t["status"]    = "won" if won else "lost"
             pct    = (current_sol_price - sol_entry) / sol_entry * 100
             payout = round(size / entry_price, 2) if won else 0.0
-            msg = (f"[SOL 5m] {'WIN' if won else 'LOSS'} | {direction} | "
+            mode_tag = "SOL LIVE" if SOL_LIVE_MODE else "SOL 5m"
+            msg = (f"[{mode_tag}] {'WIN' if won else 'LOSS'} | {direction} | "
                    f"${sol_entry:,.2f}→${current_sol_price:,.2f} ({pct:+.3f}%) | "
                    f"Payout:${payout:.2f} | PnL:${pnl:+.2f}")
             log.info(msg)
@@ -2177,8 +2285,14 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
     market_closes_at = market.get("closes_at") or closes_at
     mode_tag         = "SOL LIVE" if SOL_LIVE_MODE else "SOL 5m"
 
+    # Live mode: confirm with Polymarket BEFORE alerting or recording
+    poly_order_id = ""
     if SOL_LIVE_MODE:
-        log.warning("[SOL LIVE] Live order execution not yet implemented — recording as paper trade")
+        poly_order_id = _sol_live_order(direction, market, price, size)
+        if not poly_order_id:
+            log.warning("[SOL LIVE] Order not confirmed — OPEN alert suppressed, "
+                        "trade not recorded")
+            return
 
     msg = (
         f"[{mode_tag}] OPEN | {direction} @ ${sol_price:,.2f}\n"
@@ -2189,7 +2303,8 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         f"  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
         f"  spread={spread:.3f}  confidence={confidence:.3f}  tf={tf:.2f}\n"
         f"  Market: {market.get('title', 'N/A')}\n"
-        f"  Resolves: {market_closes_at[:19]} UTC"
+        f"  Polymarket resolves: {market_closes_at[:19]} UTC\n"
+        f"  DO NOT sell manually — wait for oracle auto-payout"
     )
     log.info(msg)
     send_alert(msg, priority="high")
@@ -2228,6 +2343,7 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         "market_title":    market.get("title", ""),
         "yes_token_id":    market.get("token_id"),
         "market_closes_at": market_closes_at,
+        "poly_order_id":   poly_order_id,
         "status":          "open",
         "won":             None,
         "pnl":             None,
