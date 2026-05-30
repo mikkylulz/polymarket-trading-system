@@ -291,6 +291,16 @@ if __name__ == "__main__":
             print("BTC loss-streak halt cleared.")
         else:
             print("No BTC trades file found.")
+    elif arg == "sol-clear-halt":
+        from crypto_scanner import SOL_TRADES_FILE
+        import json as _json
+        if SOL_TRADES_FILE.exists():
+            store = _json.loads(SOL_TRADES_FILE.read_text())
+            store["halt_until"] = None
+            SOL_TRADES_FILE.write_text(_json.dumps(store, indent=2))
+            print("SOL loss-streak halt cleared.")
+        else:
+            print("No SOL trades file found.")
     elif arg == "scan":
         scan_and_update()
     elif arg == "reset":
