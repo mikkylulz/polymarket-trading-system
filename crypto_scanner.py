@@ -1175,6 +1175,35 @@ def _query_poly_resolution(yes_token_id: str) -> Optional[bool]:
     return None   # not resolved yet / query failed
 
 
+def _query_gamma_resolution(market_id: str) -> Optional[bool]:
+    """
+    Fallback resolution check via Gamma API.
+    outcomePrices=["1","0"] → YES/UP won; ["0","1"] → NO/DOWN won.
+    Middle values (e.g. ["0.6","0.4"]) → not yet resolved → return None.
+    Note: the Gamma API has no 'isResolved' field; outcomePrices is authoritative.
+    """
+    try:
+        resp = requests.get(
+            f"https://gamma-api.polymarket.com/markets/{market_id}",
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            log.debug(f"[Gamma resolution] HTTP {resp.status_code} for market_id={market_id}")
+            return None
+        data = resp.json()
+        prices = _parse_prices(data.get("outcomePrices", "[]"))
+        if len(prices) >= 2:
+            yes_price = float(prices[0])
+            log.info(f"[Gamma resolution] market_id={market_id} outcomePrices={prices} yes_price={yes_price:.4f}")
+            if yes_price >= 0.99:
+                return True
+            elif yes_price <= 0.01:
+                return False
+    except Exception as e:
+        log.debug(f"[Gamma resolution] failed market_id={market_id}: {e}")
+    return None
+
+
 # ── Trade lifecycle ───────────────────────────────────────────
 def _close_expired_trades(current_btc_price: float):
     """Resolve any open trades whose 5-minute window has elapsed."""
@@ -1216,6 +1245,10 @@ def _close_expired_trades(current_btc_price: float):
                 yes_token_id = t.get("yes_token_id")
                 if yes_token_id:
                     yes_won = _query_poly_resolution(yes_token_id)
+                    if yes_won is None:
+                        market_id = t.get("market_id")
+                        if market_id:
+                            yes_won = _query_gamma_resolution(str(market_id))
                     if yes_won is None:
                         log.info("[BTC LIVE] Oracle not resolved yet — rechecking next scan")
                         continue
@@ -1609,11 +1642,15 @@ def _sol_current_exposure(trades: List[dict]) -> float:
     return sum(t["size"] for t in trades if t.get("status") == "open")
 
 
-def _sol_consecutive_losses(trades: List[dict], since_date: Optional[str] = None) -> int:
+def _sol_consecutive_losses(trades: List[dict], since_date: Optional[str] = None,
+                             since_iso: Optional[str] = None) -> int:
     candidates = [t for t in trades if t.get("won") is not None]
     if since_date:
         candidates = [t for t in candidates
                       if (t.get("opened_at") or "")[:10] >= since_date]
+    if since_iso:
+        candidates = [t for t in candidates
+                      if (t.get("opened_at") or "") >= since_iso]
     settled = sorted(candidates, key=lambda t: t.get("opened_at", ""))
     streak = 0
     for t in reversed(settled):
@@ -2196,6 +2233,10 @@ def _close_expired_sol_trades(current_sol_price: float):
                 if yes_token_id:
                     yes_won = _query_poly_resolution(yes_token_id)
                     if yes_won is None:
+                        market_id = t.get("market_id")
+                        if market_id:
+                            yes_won = _query_gamma_resolution(str(market_id))
+                    if yes_won is None:
                         log.info("[SOL LIVE] Oracle not resolved yet — rechecking next scan")
                         continue
                     won = yes_won if direction == "UP" else not yes_won
@@ -2376,7 +2417,8 @@ def run_sol_scan():
         log.info(f"SOL 5m: HALTED until {halt_until} UTC — loss-streak limit")
         return
 
-    streak = _sol_consecutive_losses(trades, since_date=today_str)
+    streak_reset_at = _load_sol_store().get("streak_reset_at")
+    streak = _sol_consecutive_losses(trades, since_date=today_str, since_iso=streak_reset_at)
     if streak >= MAX_SOL_CONSECUTIVE_LOSSES:
         _sol_set_halt()
         halt_until = _load_sol_store().get("halt_until", "")[:19]

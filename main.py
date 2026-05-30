@@ -294,9 +294,11 @@ if __name__ == "__main__":
     elif arg == "sol-clear-halt":
         from crypto_scanner import SOL_TRADES_FILE
         import json as _json
+        from datetime import datetime, timezone
         if SOL_TRADES_FILE.exists():
             store = _json.loads(SOL_TRADES_FILE.read_text())
             store["halt_until"] = None
+            store["streak_reset_at"] = datetime.now(timezone.utc).isoformat()
             SOL_TRADES_FILE.write_text(_json.dumps(store, indent=2))
             print("SOL loss-streak halt cleared.")
         else:
