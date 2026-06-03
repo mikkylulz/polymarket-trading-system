@@ -91,6 +91,13 @@ MIN_MINUTES_REMAINING = 1
 # Trades that have already triggered the profit alert — reset on process restart
 _profit_alerted: set = set()
 
+# ── 15m dedup sets (yes_token_id → one entry per window per process) ──────────
+# Initialized from the trades file on the first scan, then kept in sync in memory.
+_open_btc_15m_token_ids: set = set()
+_btc_15m_ids_loaded:     bool = False
+_open_sol_15m_token_ids: set = set()
+_sol_15m_ids_loaded:     bool = False
+
 # ── BTC 15-minute scanner constants ───────────────────────────
 BTC_15M_LIVE_MODE = os.getenv("BTC_15M_LIVE_MODE", "false").lower() == "true"
 BTC_15M_MIN_BET   = 2.0
@@ -2934,6 +2941,7 @@ def _find_sol_15m_market() -> Optional[dict]:
 
 def _close_expired_sol_15m_trades(current_sol_price: float):
     """Resolve any open SOL 15m trades whose window has elapsed."""
+    global _open_sol_15m_token_ids
     trades  = _load_sol_15m_trades()
     now_utc = datetime.now(timezone.utc)
     changed = False
@@ -2984,6 +2992,10 @@ def _close_expired_sol_15m_trades(current_sol_price: float):
         t["pnl"]       = pnl
         changed        = True
 
+        tok = t.get("yes_token_id", "")
+        if tok:
+            _open_sol_15m_token_ids.discard(tok)
+
         mode_tag = "SOL 15m LIVE" if SOL_15M_LIVE_MODE else "SOL 15m PAPER"
         msg = (f"[{mode_tag}] {'WIN' if won else 'LOSS'} | {direction} | "
                f"${sol_entry:.2f}→${current_sol_price:.2f} | Payout:${pnl:.2f}")
@@ -2997,6 +3009,12 @@ def _close_expired_sol_15m_trades(current_sol_price: float):
 def _enter_sol_15m_trade(direction: str, market: dict,
                           sol_price: float, candles: list):
     """Open a SOL 15-minute paper or live trade. Reuses all six SOL modules."""
+    global _open_sol_15m_token_ids
+
+    token_id = market.get("token_id", "")
+    if token_id and token_id in _open_sol_15m_token_ids:
+        log.info(f"[SOL 15m SKIP] token_id ...{token_id[-12:]} already has open position — skipping")
+        return
 
     p_trend    = _module_sol_trend(candles)
     p_level    = _module_sol_levels(sol_price, candles)
@@ -3112,6 +3130,8 @@ def _enter_sol_15m_trade(direction: str, market: dict,
         "won":            None,
         "pnl":            None,
     }
+    if token_id:
+        _open_sol_15m_token_ids.add(token_id)
     trades = _load_sol_15m_trades()
     trades.append(trade)
     _save_sol_15m_trades(trades)
@@ -3122,6 +3142,25 @@ def run_sol_15m_scan():
     SOL 15-minute scanner. Called from main.py every 4 minutes alongside
     the 5m scanners. Targets markets with 5-12 min remaining.
     """
+    global _open_sol_15m_token_ids, _sol_15m_ids_loaded
+    if not _sol_15m_ids_loaded:
+        from collections import Counter as _Counter
+        _all = _load_sol_15m_trades()
+        _open_sol_15m_token_ids = {
+            t["yes_token_id"] for t in _all
+            if t.get("status") == "open" and t.get("yes_token_id")
+        }
+        _dupe_windows = sum(
+            1 for c in _Counter(
+                t["yes_token_id"] for t in _all if t.get("yes_token_id")
+            ).values() if c > 1
+        )
+        log.info(
+            f"[SOL 15m] dedup set loaded: {len(_open_sol_15m_token_ids)} open position(s)  "
+            f"({_dupe_windows} historic windows had duplicate entries)"
+        )
+        _sol_15m_ids_loaded = True
+
     log.info("--- SOL 15m Scan ---")
 
     sol_price = _update_sol_price()
@@ -3306,6 +3345,7 @@ def _find_btc_15m_market() -> Optional[dict]:
 
 def _close_expired_15m_trades(current_btc_price: float):
     """Resolve any open 15m trades whose window has elapsed."""
+    global _open_btc_15m_token_ids
     trades  = _load_btc_15m_trades()
     now_utc = datetime.now(timezone.utc)
     changed = False
@@ -3356,6 +3396,10 @@ def _close_expired_15m_trades(current_btc_price: float):
         t["pnl"]       = pnl
         changed        = True
 
+        tok = t.get("yes_token_id", "")
+        if tok:
+            _open_btc_15m_token_ids.discard(tok)
+
         mode_tag = "BTC 15m LIVE" if BTC_15M_LIVE_MODE else "BTC 15m PAPER"
         msg = (f"[{mode_tag}] {'WIN' if won else 'LOSS'} | {direction} | "
                f"${btc_entry:,.0f}→${current_btc_price:,.0f} | "
@@ -3370,6 +3414,12 @@ def _close_expired_15m_trades(current_btc_price: float):
 def _enter_btc_15m_trade(direction: str, market: dict,
                           btc_price: float, candles: list):
     """Open a BTC 15-minute paper or live trade. Reuses all six 5m modules."""
+    global _open_btc_15m_token_ids
+
+    token_id = market.get("token_id", "")
+    if token_id and token_id in _open_btc_15m_token_ids:
+        log.info(f"[BTC 15m SKIP] token_id ...{token_id[-12:]} already has open position — skipping")
+        return
 
     # ── Six-module signal stack (identical to 5m, tag = BTC 15m) ─
     p_trend    = _module_trend(candles)
@@ -3490,6 +3540,8 @@ def _enter_btc_15m_trade(direction: str, market: dict,
         "won":            None,
         "pnl":            None,
     }
+    if token_id:
+        _open_btc_15m_token_ids.add(token_id)
     trades = _load_btc_15m_trades()
     trades.append(trade)
     _save_btc_15m_trades(trades)
@@ -3500,6 +3552,25 @@ def run_btc_15m_scan():
     BTC 15-minute scanner. Called from main.py every 4 minutes, same
     cadence as the 5m scanner. Targets markets with 5-12 min remaining.
     """
+    global _open_btc_15m_token_ids, _btc_15m_ids_loaded
+    if not _btc_15m_ids_loaded:
+        from collections import Counter as _Counter
+        _all = _load_btc_15m_trades()
+        _open_btc_15m_token_ids = {
+            t["yes_token_id"] for t in _all
+            if t.get("status") == "open" and t.get("yes_token_id")
+        }
+        _dupe_windows = sum(
+            1 for c in _Counter(
+                t["yes_token_id"] for t in _all if t.get("yes_token_id")
+            ).values() if c > 1
+        )
+        log.info(
+            f"[BTC 15m] dedup set loaded: {len(_open_btc_15m_token_ids)} open position(s)  "
+            f"({_dupe_windows} historic windows had duplicate entries)"
+        )
+        _btc_15m_ids_loaded = True
+
     log.info("--- BTC 15m Scan ---")
 
     btc_price = _update_btc_price()
