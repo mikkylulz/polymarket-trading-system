@@ -13,7 +13,7 @@ Momentum logic
 Entry conditions
   - Clear UP or DOWN momentum signal
   - Active Polymarket BTC 5-minute market found (YES = higher, NO = lower)
-  - EV >= MIN_EV using MOMENTUM_P as our estimated win probability
+  - EV >= tiered threshold using live momentum probability from _module_momentum()
   - No BTC 5m trade currently open (max 1 at a time)
 
 Hard limits (checked in order before any new entry)
@@ -28,7 +28,7 @@ Trade lifecycle
   Next scan after that timestamp resolves the trade by comparing BTC
   entry price vs current price, records PnL, and feeds learning.json.
 """
-import json, logging, re, requests, time
+import json, logging, os, re, requests, time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
@@ -61,10 +61,6 @@ MAX_HISTORY   = 10    # rolling window size
 SIGNAL_WINDOW = 2     # consecutive readings required for a signal
 TRADE_TTL     = 300   # 5 minutes
 
-# Estimated win probability when momentum is clearly directional.
-# Conservative prior: liquid-market momentum wins 51-54%; update from learning.json once 10+ trades settle.
-MOMENTUM_P = 0.53
-
 # ── BTC-specific bet sizing (overrides global MIN_BET/MAX_BET) ───────────────
 # Live small-size mode: flat $2 per trade.
 # BTC_BASE drives raw_size = BTC_BASE × confidence × (1−spread) × tf.
@@ -95,6 +91,18 @@ MIN_MINUTES_REMAINING = 1
 # Trades that have already triggered the profit alert — reset on process restart
 _profit_alerted: set = set()
 
+# ── BTC 15-minute scanner constants ───────────────────────────
+BTC_15M_LIVE_MODE = os.getenv("BTC_15M_LIVE_MODE", "false").lower() == "true"
+BTC_15M_MIN_BET   = 2.0
+BTC_15M_MAX_BET   = 2.0
+BTC_15M_BASE      = 2.0
+BTC_15M_TTL       = 900   # 15-minute window
+BTC_15M_TRADES_FILE        = BASE / "data" / "btc_15m_trades.json"
+MAX_15M_TRADES_PER_HOUR    = 4
+MAX_15M_EXPOSURE_USD       = 10.0
+MIN_15M_REMAINING_SEC      = 300   # enter when >= 5 min left
+MAX_15M_REMAINING_SEC      = 720   # enter when <= 12 min left
+
 # ── SOL 5-minute scanner constants ────────────────────────────
 SOL_MIN_BET  = 2.0
 SOL_MAX_BET  = 2.0
@@ -105,6 +113,20 @@ MAX_SOL_EXPOSURE_USD       = 10.0
 MAX_SOL_CONSECUTIVE_LOSSES = 5
 
 SOL_TRADES_FILE    = BASE / "data" / "sol_5m_trades.json"
+SOL_LIQUIDITY_CSV  = BASE / "data" / "sol_liquidity_log.csv"
+
+# ── SOL 15-minute scanner constants ───────────────────────────
+SOL_15M_LIVE_MODE           = os.getenv("SOL_15M_LIVE_MODE", "false").lower() == "true"
+SOL_15M_MIN_BET             = 2.0
+SOL_15M_MAX_BET             = 2.0
+SOL_15M_BASE                = 2.0
+SOL_15M_TTL                 = 900
+SOL_15M_TRADES_FILE         = BASE / "data" / "sol_15m_trades.json"
+MAX_SOL_15M_TRADES_PER_HOUR = 5
+MAX_SOL_15M_EXPOSURE_USD    = 10.0
+MIN_SOL_15M_REMAINING_SEC   = 300
+MAX_SOL_15M_REMAINING_SEC   = 720
+CLOB_BOOK_URL      = "https://clob.polymarket.com/book"
 COINGECKO_SOL_URL  = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 BINANCE_SOL_TICKER = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"
 
@@ -149,6 +171,32 @@ def _save_trades(trades: List[dict]):
     _save_store(store)
 
 
+def _load_btc_15m_trades() -> List[dict]:
+    if not BTC_15M_TRADES_FILE.exists():
+        return []
+    try:
+        data = json.loads(BTC_15M_TRADES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_btc_15m_trades(trades: List[dict]):
+    BTC_15M_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    BTC_15M_TRADES_FILE.write_text(json.dumps(trades, indent=2))
+
+
+def _btc_15m_exposure() -> float:
+    return sum(t["size"] for t in _load_btc_15m_trades()
+               if t.get("status") == "open")
+
+
+def _btc_15m_trades_this_hour() -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    return sum(1 for t in _load_btc_15m_trades()
+               if t.get("opened_at", "") >= cutoff)
+
+
 def _is_halted() -> bool:
     """Return True if the loss-streak halt is still active (time-based, 8h TTL)."""
     halt_until = _load_store().get("halt_until")
@@ -163,7 +211,9 @@ def _is_halted() -> bool:
 def _set_halt():
     """Engage the loss-streak halt for 8 hours from now."""
     store = _load_store()
-    store["halt_until"] = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+    halt_until = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+    store["halt_until"] = halt_until
+    store["streak_reset_at"] = halt_until  # losses before this won't re-trigger halt after expiry
     _save_store(store)
 
 
@@ -196,17 +246,21 @@ def _current_exposure(trades: List[dict]) -> float:
     return sum(t["size"] for t in trades if t.get("status") == "open")
 
 
-def _consecutive_losses(trades: List[dict], since_date: Optional[str] = None) -> int:
+def _consecutive_losses(trades: List[dict], since_date: Optional[str] = None,
+                        since_iso: Optional[str] = None) -> int:
     """Return the length of the current loss streak (most-recent settled first).
 
-    since_date (YYYY-MM-DD): when provided, only trades opened on or after that
-    date are considered.  This prevents a streak from a previous UTC day from
-    bleeding into a new day and re-triggering the halt indefinitely.
+    since_date (YYYY-MM-DD): only trades opened on or after that date.
+    since_iso (ISO timestamp): only trades opened after this timestamp — used
+      after a halt expires so the triggering losses don't re-fire the halt.
     """
     candidates = [t for t in trades if t.get("won") is not None]
     if since_date:
         candidates = [t for t in candidates
                       if (t.get("opened_at") or "")[:10] >= since_date]
+    if since_iso:
+        candidates = [t for t in candidates
+                      if (t.get("opened_at") or "") >= since_iso]
     settled = sorted(candidates, key=lambda t: t.get("opened_at", ""))
     streak = 0
     for t in reversed(settled):
@@ -334,6 +388,25 @@ def _vwap(candles: list) -> Optional[float]:
     return pv / v if v > 0 else None
 
 
+def _rsi(closes: list, period: int = 14) -> Optional[float]:
+    """Wilder RSI. Returns None when fewer than period+1 closes are available."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return round(100.0 - (100.0 / (1.0 + avg_gain / avg_loss)), 2)
+
+
 # ── Three-module conflict detector ────────────────────────────
 def _module_trend(candles: list) -> float:
     """
@@ -422,21 +495,98 @@ def _module_levels(price: float, candles: list) -> float:
     return p_level
 
 
-def _module_momentum(signal: str) -> float:
+def _module_momentum(prices: list) -> float:
     """
-    Module 3 — Momentum.
-    Wraps the existing MOMENTUM_P into a directional probability of going UP.
-      UP signal   → p = MOMENTUM_P   (e.g. 0.53)
-      DOWN signal → p = 1−MOMENTUM_P (e.g. 0.47)
-      NONE        → p = 0.50
+    Module 3 — Live Momentum.
+    % price change over the last 5 readings maps to probability of price going UP.
+
+    BTC tiers (5-reading window, ~20 min of data at 4-min scan cadence):
+      >= +0.15%  -> 0.68  (strong UP)
+      >= +0.05%  -> 0.57  (mild UP)
+      >= -0.05%  -> 0.50  (flat)
+      >= -0.15%  -> 0.43  (mild DOWN)
+      <  -0.15%  -> 0.32  (strong DOWN)
     """
-    if signal == "UP":
-        p = MOMENTUM_P
-    elif signal == "DOWN":
-        p = round(1.0 - MOMENTUM_P, 4)
+    window = [p for _, p in prices[-5:]] if prices else []
+    if len(window) < 2:
+        log.info("[BTC MOMENTUM] insufficient history (<2 readings) — neutral 0.500")
+        return 0.50
+    pct = (window[-1] - window[0]) / window[0] * 100
+    if pct >= 0.15:
+        p, label = 0.68, "strong UP"
+    elif pct >= 0.05:
+        p, label = 0.57, "mild UP"
+    elif pct >= -0.05:
+        p, label = 0.50, "flat"
+    elif pct >= -0.15:
+        p, label = 0.43, "mild DOWN"
     else:
-        p = 0.5
-    log.info(f"[BTC MOMENTUM] signal={signal} p_momentum={p:.3f}")
+        p, label = 0.32, "strong DOWN"
+    sign = "+" if pct >= 0 else ""
+    log.info(f"[BTC MOMENTUM] price_change={sign}{pct:.3f}% -> p_momentum={p:.3f} -> signal={label}")
+    return p
+
+
+def _module_reversal(candles: list, tag: str = "BTC") -> float:
+    """
+    Module 6 — Reversal / Trend Exhaustion (shared by BTC and SOL).
+    Returns probability of price going UP:
+      0.30 = overbought (DOWN signal)
+      0.70 = oversold   (UP signal)
+      0.50 = neutral
+
+    Triggers on ANY of:
+      - RSI(14) > 60  or  RSI(14) < 40
+      - Price > 0.8% above VWAP  or  < 0.8% below VWAP
+      - 5+ consecutive same-direction candles in last 10
+    """
+    if len(candles) < 15:
+        log.info(f"[{tag} REVERSAL] insufficient candles ({len(candles)}) — neutral 0.500")
+        return 0.50
+
+    closes = [c["close"] for c in candles]
+    price  = closes[-1]
+
+    rsi        = _rsi(closes, 14)
+    vwap       = _vwap(candles)
+    vwap_dist  = ((price - vwap) / vwap * 100.0) if vwap else 0.0
+
+    # Count consecutive same-direction candles from the most recent backwards
+    recent = candles[-10:]
+    consec_up = consec_dn = 0
+    last_up: Optional[bool] = None
+    for c in reversed(recent):
+        is_up = c["close"] >= c["open"]
+        if last_up is None:
+            last_up = is_up
+        if is_up == last_up and is_up:
+            consec_up += 1
+        elif is_up == last_up and not is_up:
+            consec_dn += 1
+        else:
+            break
+
+    overbought = ((rsi is not None and rsi > 60)
+                  or vwap_dist > 0.8
+                  or consec_up >= 5)
+    oversold   = ((rsi is not None and rsi < 40)
+                  or vwap_dist < -0.8
+                  or consec_dn >= 5)
+
+    if overbought:
+        p, signal = 0.30, "DOWN coming"
+    elif oversold:
+        p, signal = 0.70, "UP coming"
+    else:
+        p, signal = 0.50, "neutral"
+
+    rsi_str    = f"{rsi:.1f}" if rsi is not None else "n/a"
+    consec_str = (f"consec_up={consec_up}" if consec_up > consec_dn
+                  else f"consec_dn={consec_dn}")
+    log.info(
+        f"[{tag} REVERSAL] rsi={rsi_str} vwap_dist={vwap_dist:+.2f}% "
+        f"{consec_str} -> p_reversal={p:.2f} ({signal})"
+    )
     return p
 
 
@@ -620,7 +770,12 @@ def _is_5m(title: str, slug: str = "") -> bool:
 
 
 def _fetch_5m_market_by_slug(ts: int) -> Optional[dict]:
-    """Fetch a specific 5-minute market by its Unix timestamp slug."""
+    """Fetch a specific 5-minute market by its Unix timestamp slug.
+
+    Validates that the API returned the exact slug requested — the Gamma API
+    does fuzzy/nearest matching, so a non-existent future slug can return a
+    stale past market.  Only return if the slug matches exactly.
+    """
     slug = f"btc-updown-5m-{ts}"
     try:
         resp = requests.get(f"{POLY_API}/events", params={"slug": slug}, timeout=10)
@@ -628,7 +783,9 @@ def _fetch_5m_market_by_slug(ts: int) -> Optional[dict]:
         data = resp.json()
         events = data if isinstance(data, list) else data.get("data", [])
         if events:
-            return events[0]
+            ev = events[0]
+            if (ev.get("slug") or "").lower() == slug:
+                return ev
     except Exception:
         pass
     return None
@@ -648,20 +805,12 @@ def _find_btc_5m_market() -> Optional[dict]:
     today_iso    = datetime.now(timezone.utc).date().isoformat()
     tomorrow_iso = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
 
-    searches = [
-        # Targeted crypto search
-        {"tag_slug": "crypto", "active": "true", "closed": "false",
-         "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 100},
-        # Broad search with higher limit to catch 5-min markets
-        {"active": "true", "closed": "false",
-         "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 500},
-        # Search without date filter — 5-min markets may have very near end_date
-        {"tag_slug": "crypto", "active": "true", "closed": "false", "limit": 500},
-    ]
+    # One targeted search — date-filtered, crypto-scoped, slug pre-filtered below.
+    # Primary slug lookup handles the current window directly; this catches edge cases.
+    fallback_params = {"tag_slug": "crypto", "active": "true", "closed": "false",
+                       "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 100}
 
     # ── Primary: direct slug lookup by calculated timestamp ──────
-    # Polymarket 5-min slugs = "btc-updown-5m-{ts}" where ts % 300 == 0.
-    # Check current window + next 3 windows (up to 15 min ahead).
     now_ts = int(datetime.now(timezone.utc).timestamp())
     current_window = (now_ts // 300) * 300
     direct_events: List[dict] = []
@@ -669,50 +818,39 @@ def _find_btc_5m_market() -> Optional[dict]:
         ts  = current_window + i * 300
         ev  = _fetch_5m_market_by_slug(ts)
         if ev:
-            log.info(f"[BTC DIRECT] Found slug btc-updown-5m-{ts}: {ev.get('title')}")
+            log.info(f"[BTC DIRECT] Found btc-updown-5m-{ts}: {ev.get('title')}")
             direct_events.append(ev)
 
     seen_ids: set = set()
     btc_candidates: List[dict] = []
 
-    # Add directly-fetched events first
     for ev in direct_events:
         eid = ev.get("id")
         if eid and eid not in seen_ids:
             seen_ids.add(eid)
             btc_candidates.append(ev)
 
-    for params in searches:
-        try:
-            events = _fetch_events(params)
-        except Exception as e:
-            log.warning(f"BTC market fetch failed (params={params}): {e}")
-            continue
-
-        log.info(f"[BTC DEBUG] API returned {len(events)} events (params={params})")
+    # ── Fallback: single API search with slug pre-filter ─────────
+    try:
+        events = _fetch_events(fallback_params)
+        raw_count = len(events)
         for event in events:
             eid   = event.get("id")
-            title = event.get("title") or ""
-            slug  = event.get("slug")  or ""
-            log.info(f"  [BTC DEBUG] id={eid}  title={title!r}  slug={slug!r}")
-
+            slug  = (event.get("slug") or "").lower()
+            title = (event.get("title") or "").lower()
+            # Slug pre-filter: skip anything that can't be a BTC market
+            if not (slug.startswith("btc-updown-5m-") or
+                    slug.startswith("bitcoin-up-or-down") or
+                    "bitcoin" in slug or "btc" in slug):
+                continue
             if eid in seen_ids:
                 continue
             seen_ids.add(eid)
-
-            if _is_btc(title.lower(), slug.lower()):
+            if _is_btc(title, slug):
                 btc_candidates.append(event)
-
-    # Summary: every event that passed _is_btc, before the 5m filter
-    if btc_candidates:
-        log.info(f"[BTC DEBUG] {len(btc_candidates)} event(s) passed _is_btc filter:")
-        for ev in btc_candidates:
-            t = (ev.get("title") or "").lower()
-            s = (ev.get("slug")  or "").lower()
-            passes_5m = _is_5m(t, s)
-            log.info(f"  [{ev.get('id','?')}] {ev.get('title')!r}  slug={ev.get('slug')!r}  5m={passes_5m}")
-    else:
-        log.info("[BTC DEBUG] No events passed _is_btc filter — check titles/slugs above")
+        log.info(f"[BTC SEARCH] {raw_count} events fetched → {len(btc_candidates)} BTC candidates")
+    except Exception as e:
+        log.warning(f"[BTC SEARCH] fallback fetch failed: {e}")
 
     # Apply 5m filter — collect all valid market candidates, pick best at end
     valid_markets: List[dict] = []
@@ -826,14 +964,18 @@ def _find_btc_5m_market() -> Optional[dict]:
             except Exception:
                 pass
 
-        # Fallback: hourly format "9AM ET" — close = start + 1 hour
+        # Fallback: hourly format "9AM ET" — close = start + 1 hour.
+        # The leading \b and negative lookbehind (?<!:) prevent matching the
+        # minutes portion of a 5-min time range like "9:55PM ET" as hour 55.
         if title_close is None:
-            _tm = _re.search(r'(\d{1,2})(AM|PM)\s+ET', name, _re.IGNORECASE)
+            _tm = _re.search(r'(?<!\d)(?<!:)\b(\d{1,2})(AM|PM)\s+ET', name, _re.IGNORECASE)
             if _tm:
                 try:
                     hr   = int(_tm.group(1))
                     ampm = _tm.group(2).upper()
-                    if ampm == "PM" and hr != 12:
+                    if hr > 12:   # sanity: hours 13–23 are invalid, skip
+                        _tm = None
+                    elif ampm == "PM" and hr != 12:
                         hr += 12
                     elif ampm == "AM" and hr == 12:
                         hr = 0
@@ -1348,12 +1490,13 @@ def _record_to_learning(trade: dict):
 
 
 def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
-    """Open a paper (or live) BTC 5m trade using the five-module conflict detector."""
+    """Open a paper (or live) BTC 5m trade using the six-module conflict detector."""
 
-    # ── Five-module conflict detector ─────────────────────────────
-    p_trend    = _module_trend(candles)
-    p_level    = _module_levels(btc_price, candles)
-    p_momentum = _module_momentum(direction)
+    # ── Six-module signal stack ────────────────────────────────────
+    p_trend     = _module_trend(candles)
+    p_level     = _module_levels(btc_price, candles)
+    p_momentum  = _module_momentum(_btc_prices)
+    p_reversal  = _module_reversal(candles, "BTC")
 
     # Modules 4 & 5: funding rate and open interest
     p_funding, funding_adj = _module_funding(direction)
@@ -1363,6 +1506,9 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
     p_trend    = round(max(0.0, min(1.0, p_trend    + funding_adj)), 3)
     p_momentum = round(max(0.0, min(1.0, p_momentum + funding_adj)), 3)
 
+    # Spread conflict check uses original 5 directional modules only.
+    # p_reversal is contrarian by design and intentionally disagrees with trend —
+    # including it would cause false conflict gates on every exhaustion signal.
     all_p  = (p_trend, p_level, p_momentum, p_funding, p_oi)
     spread = round(max(all_p) - min(all_p), 3)
 
@@ -1375,9 +1521,10 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
         return
 
     # Weighted confidence: probability of price going UP (weights sum to 1.0)
+    # trend=0.30  level=0.25  momentum=0.25  reversal=0.10  funding=0.05  oi=0.05
     confidence_base = round(
         0.30 * p_trend + 0.25 * p_level + 0.25 * p_momentum
-        + 0.10 * p_funding + 0.10 * p_oi,
+        + 0.05 * p_funding + 0.05 * p_oi + 0.10 * p_reversal,
         3,
     )
     # OI post-adjustment: squeeze reduces, confirmation adds conviction
@@ -1393,10 +1540,21 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
         return
 
     ev = calc_ev(win_prob, price)
-    if ev < 0.05:
-        log.info(f"[BTC EV GATE] entry={price:.2f} EV={ev:.4f} < 0.05 min — skip")
+    # Direction-asymmetric EV tiers: DOWN requires 2× the edge of UP (diagnostic: DOWN avg EV 0.46 vs UP 1.21)
+    if price <= 0.30:
+        ev_min, tier_label = (0.30, "≤30¢") if direction == "DOWN" else (0.15, "≤30¢")
+    else:
+        ev_min, tier_label = (0.16, "30-50¢") if direction == "DOWN" else (0.08, "30-50¢")
+    if ev < ev_min:
+        log.info(
+            f"[BTC EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+            f"< {ev_min:.2f} min for {tier_label} {direction} tier — skip"
+        )
         return
-    log.info(f"[BTC EV GATE] entry={price:.2f} EV={ev:.4f} >= 0.05 — ENTER")
+    log.info(
+        f"[BTC EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+        f">= {ev_min:.2f} min for {tier_label} {direction} tier — ENTER"
+    )
 
     tf = _time_factor(market.get("closes_at"))
 
@@ -1437,7 +1595,7 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
         f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
-        f"  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
+        f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
         f"  spread={spread:.3f}  confidence={confidence:.3f}  tf={tf:.2f}\n"
         f"  Market: {market.get('title', 'N/A')}\n"
         f"  Polymarket resolves: {market_closes_at[:19]} UTC\n"
@@ -1468,6 +1626,7 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
         "p_trend":        p_trend,
         "p_level":        p_level,
         "p_momentum":     p_momentum,
+        "p_reversal":     p_reversal,
         "p_funding":      p_funding,
         "p_oi":           p_oi,
         "spread":         spread,
@@ -1608,6 +1767,32 @@ def _save_sol_trades(trades: List[dict]):
     _save_sol_store(store)
 
 
+def _load_sol_15m_trades() -> List[dict]:
+    if not SOL_15M_TRADES_FILE.exists():
+        return []
+    try:
+        data = json.loads(SOL_15M_TRADES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_sol_15m_trades(trades: List[dict]):
+    SOL_15M_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SOL_15M_TRADES_FILE.write_text(json.dumps(trades, indent=2))
+
+
+def _sol_15m_exposure() -> float:
+    return sum(t["size"] for t in _load_sol_15m_trades()
+               if t.get("status") == "open")
+
+
+def _sol_15m_trades_this_hour() -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    return sum(1 for t in _load_sol_15m_trades()
+               if t.get("opened_at", "") >= cutoff)
+
+
 def _sol_is_halted() -> bool:
     halt_until = _load_sol_store().get("halt_until")
     if not halt_until:
@@ -1620,8 +1805,120 @@ def _sol_is_halted() -> bool:
 
 def _sol_set_halt():
     store = _load_sol_store()
-    store["halt_until"] = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+    halt_until = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+    store["halt_until"] = halt_until
+    store["streak_reset_at"] = halt_until  # losses before this won't re-trigger halt after expiry
     _save_sol_store(store)
+
+
+def _sol_liquidity_active() -> bool:
+    """True if the 48h SOL liquidity diagnostic window is still running."""
+    until = _load_sol_store().get("liquidity_until")
+    if not until:
+        return False
+    try:
+        return datetime.fromisoformat(until) > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _append_liquidity_csv(ts: str, signal_price: float, best_ask,
+                           size_at_best_usd, total_top5_usd,
+                           would_fill: bool, slippage_cents, market_title: str):
+    import csv as _csv_local
+    write_header = not SOL_LIQUIDITY_CSV.exists()
+    with open(SOL_LIQUIDITY_CSV, "a", newline="") as f:
+        w = _csv_local.writer(f)
+        if write_header:
+            w.writerow(["timestamp", "signal_price", "best_ask", "size_at_best_ask",
+                        "total_top5_size", "would_fill", "slippage_cents", "market_slug"])
+        w.writerow([ts, signal_price, best_ask, size_at_best_usd, total_top5_usd,
+                    would_fill, slippage_cents if slippage_cents is not None else "", market_title])
+
+
+def _maybe_log_liquidity_summary():
+    import csv as _csv_local
+    try:
+        with open(SOL_LIQUIDITY_CSV, "r") as f:
+            rows = list(_csv_local.DictReader(f))
+        total = len(rows)
+        if total == 0 or total % 10 != 0:
+            return
+        fills   = [r for r in rows if r.get("would_fill", "").lower() == "true"]
+        slips   = [float(r["slippage_cents"]) for r in fills if r.get("slippage_cents")]
+        avg_slip = round(sum(slips) / len(slips), 1) if slips else 0.0
+        n_fill  = len(fills)
+        n_insuf = total - n_fill
+        summary = (f"[SOL LIQUIDITY SUMMARY] {total} checks total, "
+                   f"{n_fill} would_fill ({round(n_fill/total*100)}%), "
+                   f"{n_insuf} insufficient ({round(n_insuf/total*100)}%), "
+                   f"avg_slippage when filling: {avg_slip}¢")
+        log.info(summary)
+        send_alert(summary, priority="normal")
+    except Exception as e:
+        log.debug(f"[SOL LIQUIDITY] summary error: {e}")
+
+
+def _sol_liquidity_check(token_id: str, signal_price: float, direction: str,
+                          market_title: str, size: float):
+    """Fetch CLOB order book and evaluate liquidity depth for a $size SOL trade."""
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        resp = requests.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[SOL LIQUIDITY] Order book fetch failed: {e}")
+        _append_liquidity_csv(ts, signal_price, None, 0, 0, False, None, market_title)
+        return
+
+    asks = data.get("asks", [])
+    if not asks:
+        log.warning("[SOL LIQUIDITY] No asks in order book — INSUFFICIENT (empty book)")
+        _append_liquidity_csv(ts, signal_price, None, 0, 0, False, None, market_title)
+        _maybe_log_liquidity_summary()
+        return
+
+    asks_sorted = sorted(asks, key=lambda x: float(x.get("price", 0)))
+    top5 = asks_sorted[:5]
+
+    best_ask       = float(top5[0]["price"])
+    best_ask_shares = float(top5[0]["size"])
+    size_at_best_usd = round(best_ask_shares * best_ask, 2)
+    total_top5_usd = round(sum(float(a["size"]) * float(a["price"]) for a in top5), 2)
+
+    # FOK limit = signal_price + 0.03 (matches _sol_live_order).
+    # Only count shares at or below that limit — anything higher will not fill.
+    fok_limit     = round(signal_price + 0.03, 4)
+    shares_needed = size / signal_price if signal_price > 0 else float("inf")
+    cumulative = 0.0
+    fill_price  = None
+    for ask in top5:
+        ap = float(ask["price"])
+        if ap > fok_limit:
+            break  # remaining asks are even more expensive — stop here
+        cumulative += float(ask["size"])
+        if cumulative >= shares_needed:
+            fill_price = ap
+            break
+
+    would_fill     = fill_price is not None
+    slippage_cents = round((fill_price - signal_price) * 100, 1) if would_fill else None
+    best_ask_slip  = round((best_ask - signal_price) * 100, 1)
+
+    if would_fill:
+        msg = (f"[SOL LIQUIDITY] signal={signal_price:.2f} best_ask={best_ask:.2f} "
+               f"size_at_best=${size_at_best_usd:.0f} — sufficient "
+               f"(would fill at {fill_price:.2f}, slippage {slippage_cents:.0f}¢)")
+    else:
+        msg = (f"[SOL LIQUIDITY] signal={signal_price:.2f} best_ask={best_ask:.2f} "
+               f"size_at_best=${size_at_best_usd:.0f} — INSUFFICIENT "
+               f"(FOK limit={fok_limit:.2f}, best_ask is {best_ask_slip:.0f}¢ away — order would be killed)")
+
+    log.info(msg)
+    _append_liquidity_csv(ts, signal_price, best_ask, size_at_best_usd,
+                          total_top5_usd, would_fill, slippage_cents, market_title)
+    _maybe_log_liquidity_summary()
 
 
 def _sol_reset_daily_session(today_str: str) -> bool:
@@ -1797,14 +2094,35 @@ def _module_sol_levels(price: float, candles: list) -> float:
     return p_level
 
 
-def _module_sol_momentum(signal: str) -> float:
-    if signal == "UP":
-        p = MOMENTUM_P
-    elif signal == "DOWN":
-        p = round(1.0 - MOMENTUM_P, 4)
+def _module_sol_momentum(prices: list) -> float:
+    """
+    Module 3 — Live Momentum (SOL).
+    Tighter than original 0.60/0.20 bands — diagnostic showed 92% flat at those widths.
+
+    SOL tiers (5-reading window):
+      >= +0.30%  -> 0.68  (strong UP)
+      >= +0.10%  -> 0.57  (mild UP)
+      >= -0.10%  -> 0.50  (flat)
+      >= -0.30%  -> 0.43  (mild DOWN)
+      <  -0.30%  -> 0.32  (strong DOWN)
+    """
+    window = [p for _, p in prices[-5:]] if prices else []
+    if len(window) < 2:
+        log.info("[SOL MOMENTUM] insufficient history (<2 readings) — neutral 0.500")
+        return 0.50
+    pct = (window[-1] - window[0]) / window[0] * 100
+    if pct >= 0.30:
+        p, label = 0.68, "strong UP"
+    elif pct >= 0.10:
+        p, label = 0.57, "mild UP"
+    elif pct >= -0.10:
+        p, label = 0.50, "flat"
+    elif pct >= -0.30:
+        p, label = 0.43, "mild DOWN"
     else:
-        p = 0.5
-    log.info(f"[SOL MOMENTUM] signal={signal} p_momentum={p:.3f}")
+        p, label = 0.32, "strong DOWN"
+    sign = "+" if pct >= 0 else ""
+    log.info(f"[SOL MOMENTUM] price_change={sign}{pct:.3f}% -> p_momentum={p:.3f} -> signal={label}")
     return p
 
 
@@ -1899,13 +2217,8 @@ def _find_sol_5m_market() -> Optional[dict]:
     today_iso    = datetime.now(timezone.utc).date().isoformat()
     tomorrow_iso = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
 
-    searches = [
-        {"tag_slug": "crypto", "active": "true", "closed": "false",
-         "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 100},
-        {"active": "true", "closed": "false",
-         "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 500},
-        {"tag_slug": "crypto", "active": "true", "closed": "false", "limit": 500},
-    ]
+    fallback_params = {"tag_slug": "crypto", "active": "true", "closed": "false",
+                       "end_date_min": today_iso, "end_date_max": tomorrow_iso, "limit": 100}
 
     # Primary: direct slug lookup by calculated window timestamp
     now_ts         = int(datetime.now(timezone.utc).timestamp())
@@ -1919,7 +2232,7 @@ def _find_sol_5m_market() -> Optional[dict]:
             resp.raise_for_status()
             data = resp.json()
             evs  = data if isinstance(data, list) else data.get("data", [])
-            if evs:
+            if evs and (evs[0].get("slug") or "").lower() == slug:
                 log.info(f"[SOL DIRECT] Found {slug}: {evs[0].get('title')}")
                 direct_events.append(evs[0])
         except Exception:
@@ -1934,29 +2247,31 @@ def _find_sol_5m_market() -> Optional[dict]:
             seen_ids.add(eid)
             sol_candidates.append(ev)
 
-    for params in searches:
-        try:
-            events = _fetch_events(params)
-        except Exception as e:
-            log.warning(f"SOL market fetch failed (params={params}): {e}")
-            continue
-        log.info(f"[SOL DEBUG] API returned {len(events)} events (params={params})")
+    # ── Fallback: single API search with slug pre-filter ─────────
+    try:
+        events = _fetch_events(fallback_params)
+        raw_count = len(events)
         for event in events:
             eid   = event.get("id")
-            title = event.get("title") or ""
-            slug  = event.get("slug")  or ""
+            slug  = (event.get("slug")  or "").lower()
+            title = (event.get("title") or "").lower()
+            # Slug pre-filter: skip anything that can't be a SOL market
+            if not (slug.startswith("sol-updown-5m-") or
+                    slug.startswith("solana-up-or-down") or
+                    "solana" in slug or "sol-updown" in slug):
+                continue
             if eid in seen_ids:
                 continue
             seen_ids.add(eid)
             if _is_sol(title, slug):
-                log.info(f"  [SOL DEBUG] id={eid}  title={title!r}  slug={slug!r}")
                 sol_candidates.append(event)
+        log.info(f"[SOL SEARCH] {raw_count} events fetched → {len(sol_candidates)} SOL candidates")
+    except Exception as e:
+        log.warning(f"[SOL SEARCH] fallback fetch failed: {e}")
 
     if not sol_candidates:
-        log.info("[SOL DEBUG] No Solana events found on Polymarket")
+        log.info("[SOL] No Solana candidates found — direct slug lookup + fallback both empty")
         return None
-
-    log.info(f"[SOL DEBUG] {len(sol_candidates)} event(s) passed _is_sol filter")
 
     valid_markets: List[dict] = []
     for event in sol_candidates:
@@ -2273,10 +2588,11 @@ def _close_expired_sol_trades(current_sol_price: float):
 
 
 def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: list):
-    # Five-module conflict detector (SOL-specific modules)
+    # Six-module signal stack (SOL-specific modules)
     p_trend    = _module_sol_trend(candles)
     p_level    = _module_sol_levels(sol_price, candles)
-    p_momentum = _module_sol_momentum(direction)
+    p_momentum = _module_sol_momentum(_sol_prices)
+    p_reversal = _module_reversal(candles, "SOL")
     p_funding, funding_adj = _module_sol_funding(direction)
     p_oi, oi_conf_adj      = _module_sol_oi(direction)
 
@@ -2294,9 +2610,10 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         )
         return
 
+    # trend=0.30  level=0.25  momentum=0.25  reversal=0.10  funding=0.05  oi=0.05
     confidence_base = round(
         0.30 * p_trend + 0.25 * p_level + 0.25 * p_momentum
-        + 0.10 * p_funding + 0.10 * p_oi,
+        + 0.05 * p_funding + 0.05 * p_oi + 0.10 * p_reversal,
         3,
     )
     confidence = round(max(0.0, min(1.0, confidence_base + oi_conf_adj)), 3)
@@ -2308,19 +2625,34 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         log.info(f"[SOL PRICE GATE] entry={price:.2f} > 0.50 max — skip")
         return
 
-    # Tiered EV: cheap entries (≤0.30) need stronger edge than mid-range entries
-    ev_min = 0.15 if price <= 0.30 else 0.08
+    # Direction-asymmetric EV tiers: DOWN requires 2× the edge of UP
     ev = calc_ev(win_prob, price)
+    if price <= 0.30:
+        ev_min, tier_label = (0.30, "≤30¢") if direction == "DOWN" else (0.15, "≤30¢")
+    else:
+        ev_min, tier_label = (0.16, "30-50¢") if direction == "DOWN" else (0.08, "30-50¢")
     if ev < ev_min:
-        log.info(f"[SOL EV GATE] entry={price:.2f} EV={ev:.4f} < {ev_min:.2f} (tier) — skip")
+        log.info(
+            f"[SOL EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+            f"< {ev_min:.2f} min for {tier_label} {direction} tier — skip"
+        )
         return
-    log.info(f"[SOL EV GATE] entry={price:.2f} EV={ev:.4f} >= {ev_min:.2f} — ENTER")
+    log.info(
+        f"[SOL EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+        f">= {ev_min:.2f} min for {tier_label} {direction} tier — ENTER"
+    )
 
     tf = _time_factor(market.get("closes_at"))
 
     raw_size      = SOL_BASE * confidence * (1.0 - spread) * tf
     exposure_room = MAX_SOL_EXPOSURE_USD - _sol_current_exposure(_load_sol_trades())
     size = round(min(max(raw_size, SOL_MIN_BET), SOL_MAX_BET, exposure_room), 2)
+
+    # Liquidity diagnostic mode: check book depth, then fall through to paper trade
+    if _sol_liquidity_active():
+        diag_token = (market.get("token_id") if direction == "UP" else market.get("no_token_id")) or ""
+        log.info(f"[SOL LIQUIDITY MODE] Signal passes all filters — running book check (paper trade continues)")
+        _sol_liquidity_check(diag_token, price, direction, market.get("title", ""), size)
 
     closes_at        = (datetime.now(timezone.utc) + timedelta(seconds=TRADE_TTL)).isoformat()
     market_closes_at = market.get("closes_at") or closes_at
@@ -2341,7 +2673,7 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         f"  EV tier: {'≤0.30 → min 0.15' if price <= 0.30 else '≤0.50 → min 0.08'}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
-        f"  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
+        f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
         f"  spread={spread:.3f}  confidence={confidence:.3f}  tf={tf:.2f}\n"
         f"  Market: {market.get('title', 'N/A')}\n"
         f"  Polymarket resolves: {market_closes_at[:19]} UTC\n"
@@ -2372,6 +2704,7 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
         "p_trend":         p_trend,
         "p_level":         p_level,
         "p_momentum":      p_momentum,
+        "p_reversal":      p_reversal,
         "p_funding":       p_funding,
         "p_oi":            p_oi,
         "spread":          spread,
@@ -2398,6 +2731,9 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
 def run_sol_scan():
     """Called from main.py sequentially after run_crypto_scan() each cycle."""
     log.info("--- SOL 5m Scan ---")
+    if _sol_liquidity_active():
+        until_str = (_load_sol_store().get("liquidity_until") or "")[:19]
+        log.info(f"[SOL] Liquidity diagnostic mode active until {until_str} UTC — signals checked, no trades placed")
 
     sol_price = _update_sol_price()
     if sol_price is None:
@@ -2453,7 +2789,753 @@ def run_sol_scan():
         _enter_sol_trade(signal, market, sol_price, candles)
 
 
+# ══════════════════════════════════════════════════════════════
+# SOL 15-MINUTE SCANNER
+# ══════════════════════════════════════════════════════════════
+
+def _fetch_sol_15m_by_slug(ts: int) -> Optional[dict]:
+    """Direct slug lookup for sol-updown-15m-{ts}. Returns event dict or None."""
+    slug = f"sol-updown-15m-{ts}"
+    try:
+        resp = requests.get(f"{POLY_API}/events", params={"slug": slug}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        evs  = data if isinstance(data, list) else data.get("data", [])
+        if evs and (evs[0].get("slug") or "").lower() == slug:
+            return evs[0]
+    except Exception:
+        pass
+    return None
+
+
+def _find_sol_15m_market() -> Optional[dict]:
+    """
+    Find an active SOL 15-minute Up/Down market with 5-12 minutes remaining.
+    Slug pattern: sol-updown-15m-{unix_ts}  (ts % 900 == 0)
+    """
+    now_ts         = int(datetime.now(timezone.utc).timestamp())
+    current_window = (now_ts // 900) * 900
+    now_utc        = datetime.now(timezone.utc)
+
+    seen_ids:   set        = set()
+    candidates: List[dict] = []
+
+    for i in range(3):
+        ts = current_window + i * 900
+        ev = _fetch_sol_15m_by_slug(ts)
+        if ev:
+            eid = ev.get("id")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                candidates.append((ts, ev))
+            log.info(f"[SOL 15m DIRECT] Found sol-updown-15m-{ts}: {ev.get('title')}")
+
+    if not candidates:
+        today    = now_utc.date().isoformat()
+        tomorrow = (now_utc.date() + timedelta(days=1)).isoformat()
+        try:
+            events = _fetch_events({
+                "tag_slug": "crypto", "active": "true", "closed": "false",
+                "end_date_min": today, "end_date_max": tomorrow, "limit": 100,
+            })
+            for ev in events:
+                slug = (ev.get("slug") or "").lower()
+                eid  = ev.get("id")
+                if not slug.startswith("sol-updown-15m-"):
+                    continue
+                if eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+                m = re.search(r"sol-updown-15m-(\d+)", slug)
+                if m:
+                    candidates.append((int(m.group(1)), ev))
+        except Exception as e:
+            log.warning(f"[SOL 15m SEARCH] fallback failed: {e}")
+
+    for ts, event in candidates:
+        window_close = ts + SOL_15M_TTL
+        remaining    = window_close - now_ts
+
+        if remaining < MIN_SOL_15M_REMAINING_SEC:
+            log.info(f"[SOL 15m] skip sol-updown-15m-{ts} — "
+                     f"only {remaining:.0f}s remaining (< {MIN_SOL_15M_REMAINING_SEC}s)")
+            continue
+        if remaining > MAX_SOL_15M_REMAINING_SEC:
+            log.info(f"[SOL 15m] skip sol-updown-15m-{ts} — "
+                     f"{remaining:.0f}s remaining (> {MAX_SOL_15M_REMAINING_SEC}s, too early)")
+            continue
+
+        eid  = event.get("id", "?")
+        name = event.get("title", "?")
+        mkts = event.get("markets", [])
+        if not mkts:
+            try:
+                detail = requests.get(f"{POLY_API}/events/{eid}", timeout=10).json()
+                mkts   = detail.get("markets", [])
+            except Exception:
+                pass
+        if not mkts:
+            log.info(f"[SOL 15m] skip {name!r} — no markets")
+            continue
+
+        m      = mkts[0]
+        prices = _parse_prices(m.get("outcomePrices", "[]"))
+        if len(prices) < 2:
+            try:
+                detail = requests.get(f"{POLY_API}/events/{eid}", timeout=10).json()
+                dm = (detail.get("markets") or [None])[0]
+                if dm:
+                    prices = _parse_prices(dm.get("outcomePrices", "[]"))
+                    if len(prices) < 2:
+                        ba = dm.get("bestAsk")
+                        if ba is not None:
+                            ya = float(ba)
+                            prices = [ya, round(1.0 - ya, 4)]
+                    m = dm
+            except Exception:
+                pass
+
+        if len(prices) < 2:
+            log.info(f"[SOL 15m] skip {name!r} — no price data")
+            continue
+
+        yes_price = float(prices[0])
+        no_price  = float(prices[1])
+        if not (0.05 <= yes_price <= 0.95):
+            continue
+        if m.get("liquidityNum", 0) == 0 and float(m.get("volume", 0) or 0) == 0:
+            log.info(f"[SOL 15m] skip {name!r} — no liquidity")
+            continue
+
+        raw_ids     = (m.get("clobTokenIds") or "").split(",")
+        token_id    = raw_ids[0].strip('"[] ') if raw_ids else None
+        no_token_id = raw_ids[1].strip('"[] ') if len(raw_ids) > 1 else None
+        closes_at   = datetime.fromtimestamp(window_close, tz=timezone.utc).isoformat()
+
+        log.info(
+            f"[SOL 15m MARKET IDENTIFIED]\n"
+            f"  Title    : {name}\n"
+            f"  Remaining: {remaining:.0f}s ({remaining/60:.1f}min)\n"
+            f"  YES={yes_price:.3f}  NO={no_price:.3f}"
+        )
+        return {
+            "title":        name,
+            "yes_price":    yes_price,
+            "no_price":     no_price,
+            "market_id":    m.get("id"),
+            "token_id":     token_id,
+            "no_token_id":  no_token_id,
+            "closes_at":    closes_at,
+            "is_5min":      False,
+        }
+
+    return None
+
+
+def _close_expired_sol_15m_trades(current_sol_price: float):
+    """Resolve any open SOL 15m trades whose window has elapsed."""
+    trades  = _load_sol_15m_trades()
+    now_utc = datetime.now(timezone.utc)
+    changed = False
+
+    for t in trades:
+        if t.get("status") != "open":
+            continue
+        closes_str = t.get("closes_at")
+        if not closes_str:
+            continue
+        try:
+            closes_at = datetime.fromisoformat(closes_str)
+        except ValueError:
+            continue
+        if now_utc < closes_at:
+            log.info(f"[SOL 15m] trade still open — "
+                     f"{(closes_at-now_utc).total_seconds():.0f}s remaining")
+            continue
+
+        direction  = t["direction"]
+        sol_entry  = t["sol_entry"]
+
+        if SOL_15M_LIVE_MODE:
+            yes_token_id = t.get("yes_token_id")
+            if yes_token_id:
+                yes_won = _query_poly_resolution(yes_token_id)
+                if yes_won is None:
+                    yes_won = _query_gamma_resolution(str(t.get("market_id", "")))
+                if yes_won is None:
+                    log.info("[SOL 15m LIVE] Oracle not resolved yet — rechecking next scan")
+                    continue
+                won = yes_won if direction == "UP" else not yes_won
+            else:
+                won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                       (direction == "DOWN" and current_sol_price < sol_entry))
+        else:
+            won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                   (direction == "DOWN" and current_sol_price < sol_entry))
+
+        entry_price = t["entry_price"]
+        size        = t["size"]
+        pnl         = round(size * (1.0 / entry_price - 1.0), 2) if won else -size
+
+        t["sol_exit"]  = current_sol_price
+        t["closed_at"] = now_utc.isoformat()
+        t["status"]    = "won" if won else "lost"
+        t["won"]       = won
+        t["pnl"]       = pnl
+        changed        = True
+
+        mode_tag = "SOL 15m LIVE" if SOL_15M_LIVE_MODE else "SOL 15m PAPER"
+        msg = (f"[{mode_tag}] {'WIN' if won else 'LOSS'} | {direction} | "
+               f"${sol_entry:.2f}→${current_sol_price:.2f} | Payout:${pnl:.2f}")
+        log.info(msg)
+        send_alert(msg, priority="normal" if won else "high")
+
+    if changed:
+        _save_sol_15m_trades(trades)
+
+
+def _enter_sol_15m_trade(direction: str, market: dict,
+                          sol_price: float, candles: list):
+    """Open a SOL 15-minute paper or live trade. Reuses all six SOL modules."""
+
+    p_trend    = _module_sol_trend(candles)
+    p_level    = _module_sol_levels(sol_price, candles)
+    p_momentum = _module_sol_momentum(_sol_prices)
+    p_reversal = _module_reversal(candles, "SOL 15m")
+    p_funding, funding_adj = _module_sol_funding(direction)
+    p_oi, oi_conf_adj      = _module_sol_oi(direction)
+
+    p_trend    = round(max(0.0, min(1.0, p_trend    + funding_adj)), 3)
+    p_momentum = round(max(0.0, min(1.0, p_momentum + funding_adj)), 3)
+
+    all_p  = (p_trend, p_level, p_momentum, p_funding, p_oi)
+    spread = round(max(all_p) - min(all_p), 3)
+
+    if spread > 0.40:
+        log.info(
+            f"[SOL 15m CONFLICT] {direction} spread={spread:.3f} > 0.40 "
+            f"(trend={p_trend:.3f} level={p_level:.3f} momentum={p_momentum:.3f} "
+            f"funding={p_funding:.3f} oi={p_oi:.3f}) — skip"
+        )
+        return
+
+    confidence_base = round(
+        0.30 * p_trend + 0.25 * p_level + 0.25 * p_momentum
+        + 0.05 * p_funding + 0.05 * p_oi + 0.10 * p_reversal,
+        3,
+    )
+    confidence = round(max(0.0, min(1.0, confidence_base + oi_conf_adj)), 3)
+    win_prob   = confidence if direction == "UP" else round(1.0 - confidence, 3)
+
+    price = market["yes_price"] if direction == "UP" else market["no_price"]
+
+    if price > 0.50:
+        log.info(f"[SOL 15m PRICE GATE] entry={price:.2f} > 0.50 — skip")
+        return
+
+    ev = calc_ev(win_prob, price)
+    if price <= 0.30:
+        ev_min, tier_label = (0.30, "≤30¢") if direction == "DOWN" else (0.15, "≤30¢")
+    else:
+        ev_min, tier_label = (0.16, "30-50¢") if direction == "DOWN" else (0.08, "30-50¢")
+    if ev < ev_min:
+        log.info(
+            f"[SOL 15m EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+            f"< {ev_min:.2f} min for {tier_label} {direction} tier — skip"
+        )
+        return
+    log.info(
+        f"[SOL 15m EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+        f">= {ev_min:.2f} min for {tier_label} {direction} tier — ENTER"
+    )
+
+    tf = _time_factor(market.get("closes_at"))
+
+    raw_size      = SOL_15M_BASE * confidence * (1.0 - spread) * tf
+    exposure_room = MAX_SOL_15M_EXPOSURE_USD - _sol_15m_exposure()
+    size = round(min(max(raw_size, SOL_15M_MIN_BET), SOL_15M_MAX_BET, exposure_room), 2)
+
+    closes_at        = market.get("closes_at") or (
+        datetime.now(timezone.utc) + timedelta(seconds=SOL_15M_TTL)).isoformat()
+    market_closes_at = closes_at
+    mode_tag         = "SOL 15m LIVE" if SOL_15M_LIVE_MODE else "SOL 15m PAPER"
+
+    poly_order_id = ""
+    if SOL_15M_LIVE_MODE:
+        poly_order_id = _sol_live_order(direction, market, price, size)
+        if not poly_order_id:
+            log.warning("[SOL 15m LIVE] Order not confirmed — trade not recorded")
+            return
+
+    msg = (
+        f"[{mode_tag}] OPEN | {direction} @ ${sol_price:.2f}\n"
+        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"  Break-even WR: {round(price * 100, 1)}%\n"
+        f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
+        f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
+        f"  spread={spread:.3f}  confidence={confidence:.3f}  tf={tf:.2f}\n"
+        f"  Market: {market.get('title', 'N/A')}\n"
+        f"  Polymarket resolves: {market_closes_at[:19]} UTC\n"
+        f"  DO NOT sell manually — wait for oracle auto-payout"
+    )
+    log.info(msg)
+    send_alert(msg, priority="high")
+
+    opened_at = datetime.now(timezone.utc).isoformat()
+    trade = {
+        "id":             f"sol15m_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+        "timeframe":      "15m",
+        "opened_at":      opened_at,
+        "closes_at":      closes_at,
+        "direction":      direction,
+        "entry_price":    price,
+        "sol_entry":      sol_price,
+        "sol_exit":       None,
+        "p":              win_prob,
+        "p_trend":        p_trend,
+        "p_level":        p_level,
+        "p_momentum":     p_momentum,
+        "p_reversal":     p_reversal,
+        "p_funding":      p_funding,
+        "p_oi":           p_oi,
+        "spread":         spread,
+        "confidence":     confidence,
+        "time_factor":    round(tf, 3),
+        "ev":             round(ev, 4),
+        "size":           size,
+        "market_id":      market.get("market_id"),
+        "market_title":   market.get("title", ""),
+        "yes_token_id":   market.get("token_id"),
+        "market_closes_at": market_closes_at,
+        "poly_order_id":  poly_order_id,
+        "status":         "open",
+        "won":            None,
+        "pnl":            None,
+    }
+    trades = _load_sol_15m_trades()
+    trades.append(trade)
+    _save_sol_15m_trades(trades)
+
+
+def run_sol_15m_scan():
+    """
+    SOL 15-minute scanner. Called from main.py every 4 minutes alongside
+    the 5m scanners. Targets markets with 5-12 min remaining.
+    """
+    log.info("--- SOL 15m Scan ---")
+
+    sol_price = _update_sol_price()
+    if sol_price is None:
+        log.warning("[SOL 15m] no price available — skipping scan")
+        return
+
+    _close_expired_sol_15m_trades(sol_price)
+
+    hourly = _sol_15m_trades_this_hour()
+    if hourly >= MAX_SOL_15M_TRADES_PER_HOUR:
+        log.info(f"[SOL 15m] hourly cap {hourly}/{MAX_SOL_15M_TRADES_PER_HOUR} — skip")
+        return
+
+    exposure = _sol_15m_exposure()
+    if exposure >= MAX_SOL_15M_EXPOSURE_USD:
+        log.info(f"[SOL 15m] exposure ${exposure:.2f} >= ${MAX_SOL_15M_EXPOSURE_USD:.2f} — skip")
+        return
+
+    open_count = sum(1 for t in _load_sol_15m_trades() if t.get("status") == "open")
+    if open_count >= 3:
+        log.info(f"[SOL 15m] {open_count} trades already open — skip")
+        return
+
+    candles = _fetch_sol_candles(30)
+    market  = _find_sol_15m_market()
+    if market is None:
+        return
+
+    signal = _sol_momentum_signal()
+    if signal != "NONE":
+        _enter_sol_15m_trade(signal, market, sol_price, candles)
+
+
 # ── BTC entry point ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# BTC 15-MINUTE SCANNER
+# ══════════════════════════════════════════════════════════════
+
+def _fetch_btc_15m_by_slug(ts: int) -> Optional[dict]:
+    """Direct slug lookup for btc-updown-15m-{ts}. Returns event dict or None."""
+    slug = f"btc-updown-15m-{ts}"
+    try:
+        resp = requests.get(f"{POLY_API}/events", params={"slug": slug}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        evs  = data if isinstance(data, list) else data.get("data", [])
+        if evs and (evs[0].get("slug") or "").lower() == slug:
+            return evs[0]
+    except Exception:
+        pass
+    return None
+
+
+def _find_btc_15m_market() -> Optional[dict]:
+    """
+    Find an active BTC 15-minute Up/Down market with 5-12 minutes remaining.
+
+    Slug pattern: btc-updown-15m-{unix_ts}  (ts % 900 == 0)
+    Window: ts → ts+900.  Enter when 300-720 seconds remain.
+    """
+    now_ts         = int(datetime.now(timezone.utc).timestamp())
+    current_window = (now_ts // 900) * 900
+    now_utc        = datetime.now(timezone.utc)
+
+    seen_ids: set        = set()
+    candidates: List[dict] = []
+
+    # Primary: check current window + next 2 (covers the 5-12 min entry zone)
+    for i in range(3):
+        ts = current_window + i * 900
+        ev = _fetch_btc_15m_by_slug(ts)
+        if ev:
+            eid = ev.get("id")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                candidates.append((ts, ev))
+            log.info(f"[BTC 15m DIRECT] Found btc-updown-15m-{ts}: {ev.get('title')}")
+
+    # Fallback: single API search scoped to crypto + today
+    if not candidates:
+        today    = now_utc.date().isoformat()
+        tomorrow = (now_utc.date() + timedelta(days=1)).isoformat()
+        try:
+            events = _fetch_events({
+                "tag_slug": "crypto", "active": "true", "closed": "false",
+                "end_date_min": today, "end_date_max": tomorrow, "limit": 100,
+            })
+            for ev in events:
+                slug = (ev.get("slug") or "").lower()
+                eid  = ev.get("id")
+                if not slug.startswith("btc-updown-15m-"):
+                    continue
+                if eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+                m = re.search(r"btc-updown-15m-(\d+)", slug)
+                if m:
+                    candidates.append((int(m.group(1)), ev))
+        except Exception as e:
+            log.warning(f"[BTC 15m SEARCH] fallback failed: {e}")
+
+    for ts, event in candidates:
+        window_close = ts + BTC_15M_TTL
+        remaining    = window_close - now_ts
+
+        if remaining < MIN_15M_REMAINING_SEC:
+            log.info(f"[BTC 15m] skip btc-updown-15m-{ts} — "
+                     f"only {remaining:.0f}s remaining (< {MIN_15M_REMAINING_SEC}s)")
+            continue
+        if remaining > MAX_15M_REMAINING_SEC:
+            log.info(f"[BTC 15m] skip btc-updown-15m-{ts} — "
+                     f"{remaining:.0f}s remaining (> {MAX_15M_REMAINING_SEC}s, too early)")
+            continue
+
+        eid  = event.get("id", "?")
+        name = event.get("title", "?")
+        mkts = event.get("markets", [])
+        if not mkts:
+            try:
+                detail = requests.get(f"{POLY_API}/events/{eid}", timeout=10).json()
+                mkts   = detail.get("markets", [])
+            except Exception:
+                pass
+        if not mkts:
+            log.info(f"[BTC 15m] skip {name!r} — no markets")
+            continue
+
+        m      = mkts[0]
+        prices = _parse_prices(m.get("outcomePrices", "[]"))
+        if len(prices) < 2:
+            try:
+                detail = requests.get(f"{POLY_API}/events/{eid}", timeout=10).json()
+                dm     = (detail.get("markets") or [None])[0]
+                if dm:
+                    prices = _parse_prices(dm.get("outcomePrices", "[]"))
+                    if len(prices) < 2:
+                        ba = dm.get("bestAsk")
+                        if ba is not None:
+                            ya = float(ba)
+                            prices = [ya, round(1.0 - ya, 4)]
+                    m = dm
+            except Exception:
+                pass
+
+        if len(prices) < 2:
+            log.info(f"[BTC 15m] skip {name!r} — no price data")
+            continue
+
+        yes_price = float(prices[0])
+        no_price  = float(prices[1])
+        if not (0.05 <= yes_price <= 0.95):
+            continue
+        if m.get("liquidityNum", 0) == 0 and float(m.get("volume", 0) or 0) == 0:
+            log.info(f"[BTC 15m] skip {name!r} — no liquidity")
+            continue
+
+        raw_ids     = (m.get("clobTokenIds") or "").split(",")
+        token_id    = raw_ids[0].strip('"[] ') if raw_ids else None
+        no_token_id = raw_ids[1].strip('"[] ') if len(raw_ids) > 1 else None
+        closes_at   = datetime.fromtimestamp(window_close, tz=timezone.utc).isoformat()
+
+        log.info(
+            f"[BTC 15m MARKET IDENTIFIED]\n"
+            f"  Title    : {name}\n"
+            f"  Remaining: {remaining:.0f}s ({remaining/60:.1f}min)\n"
+            f"  YES={yes_price:.3f}  NO={no_price:.3f}"
+        )
+        return {
+            "title":        name,
+            "yes_price":    yes_price,
+            "no_price":     no_price,
+            "market_id":    m.get("id"),
+            "token_id":     token_id,
+            "no_token_id":  no_token_id,
+            "closes_at":    closes_at,
+            "is_5min":      False,
+        }
+
+    return None
+
+
+def _close_expired_15m_trades(current_btc_price: float):
+    """Resolve any open 15m trades whose window has elapsed."""
+    trades  = _load_btc_15m_trades()
+    now_utc = datetime.now(timezone.utc)
+    changed = False
+
+    for t in trades:
+        if t.get("status") != "open":
+            continue
+        closes_str = t.get("closes_at")
+        if not closes_str:
+            continue
+        try:
+            closes_at = datetime.fromisoformat(closes_str)
+        except ValueError:
+            continue
+        if now_utc < closes_at:
+            log.info(f"[BTC 15m] trade still open — "
+                     f"{(closes_at-now_utc).total_seconds():.0f}s remaining")
+            continue
+
+        direction   = t["direction"]
+        btc_entry   = t["btc_entry"]
+
+        if BTC_15M_LIVE_MODE:
+            yes_token_id = t.get("yes_token_id")
+            if yes_token_id:
+                yes_won = _query_poly_resolution(yes_token_id)
+                if yes_won is None:
+                    yes_won = _query_gamma_resolution(str(t.get("market_id", "")))
+                if yes_won is None:
+                    log.info("[BTC 15m LIVE] Oracle not resolved yet — rechecking next scan")
+                    continue
+                won = yes_won if direction == "UP" else not yes_won
+            else:
+                won = ((direction == "UP"   and current_btc_price > btc_entry) or
+                       (direction == "DOWN" and current_btc_price < btc_entry))
+        else:
+            won = ((direction == "UP"   and current_btc_price > btc_entry) or
+                   (direction == "DOWN" and current_btc_price < btc_entry))
+
+        entry_price = t["entry_price"]
+        size        = t["size"]
+        pnl         = round(size * (1.0 / entry_price - 1.0), 2) if won else -size
+
+        t["btc_exit"]  = current_btc_price
+        t["closed_at"] = now_utc.isoformat()
+        t["status"]    = "won" if won else "lost"
+        t["won"]       = won
+        t["pnl"]       = pnl
+        changed        = True
+
+        mode_tag = "BTC 15m LIVE" if BTC_15M_LIVE_MODE else "BTC 15m PAPER"
+        msg = (f"[{mode_tag}] {'WIN' if won else 'LOSS'} | {direction} | "
+               f"${btc_entry:,.0f}→${current_btc_price:,.0f} | "
+               f"Payout:${pnl:.2f}")
+        log.info(msg)
+        send_alert(msg, priority="normal" if won else "high")
+
+    if changed:
+        _save_btc_15m_trades(trades)
+
+
+def _enter_btc_15m_trade(direction: str, market: dict,
+                          btc_price: float, candles: list):
+    """Open a BTC 15-minute paper or live trade. Reuses all six 5m modules."""
+
+    # ── Six-module signal stack (identical to 5m, tag = BTC 15m) ─
+    p_trend    = _module_trend(candles)
+    p_level    = _module_levels(btc_price, candles)
+    p_momentum = _module_momentum(_btc_prices)
+    p_reversal = _module_reversal(candles, "BTC 15m")
+
+    p_funding, funding_adj = _module_funding(direction)
+    p_oi, oi_conf_adj      = _module_oi(direction)
+
+    p_trend    = round(max(0.0, min(1.0, p_trend    + funding_adj)), 3)
+    p_momentum = round(max(0.0, min(1.0, p_momentum + funding_adj)), 3)
+
+    all_p  = (p_trend, p_level, p_momentum, p_funding, p_oi)
+    spread = round(max(all_p) - min(all_p), 3)
+
+    if spread > 0.40:
+        log.info(
+            f"[BTC 15m CONFLICT] {direction} spread={spread:.3f} > 0.40 "
+            f"(trend={p_trend:.3f} level={p_level:.3f} momentum={p_momentum:.3f} "
+            f"funding={p_funding:.3f} oi={p_oi:.3f}) — skip"
+        )
+        return
+
+    # Same weights as 5m: trend=0.30 level=0.25 momentum=0.25
+    #                     reversal=0.10 funding=0.05 oi=0.05
+    confidence_base = round(
+        0.30 * p_trend + 0.25 * p_level + 0.25 * p_momentum
+        + 0.05 * p_funding + 0.05 * p_oi + 0.10 * p_reversal,
+        3,
+    )
+    confidence = round(max(0.0, min(1.0, confidence_base + oi_conf_adj)), 3)
+    win_prob   = confidence if direction == "UP" else round(1.0 - confidence, 3)
+
+    price = market["yes_price"] if direction == "UP" else market["no_price"]
+
+    if price > 0.50:
+        log.info(f"[BTC 15m PRICE GATE] entry={price:.2f} > 0.50 — skip")
+        return
+
+    ev = calc_ev(win_prob, price)
+    # Same direction-asymmetric EV tiers as 5m
+    if price <= 0.30:
+        ev_min, tier_label = (0.30, "≤30¢") if direction == "DOWN" else (0.15, "≤30¢")
+    else:
+        ev_min, tier_label = (0.16, "30-50¢") if direction == "DOWN" else (0.08, "30-50¢")
+    if ev < ev_min:
+        log.info(
+            f"[BTC 15m EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+            f"< {ev_min:.2f} min for {tier_label} {direction} tier — skip"
+        )
+        return
+    log.info(
+        f"[BTC 15m EV TIER] {direction} entry={price:.2f} EV={ev:.4f} "
+        f">= {ev_min:.2f} min for {tier_label} {direction} tier — ENTER"
+    )
+
+    tf = _time_factor(market.get("closes_at"))
+
+    raw_size      = BTC_15M_BASE * confidence * (1.0 - spread) * tf
+    exposure_room = MAX_15M_EXPOSURE_USD - _btc_15m_exposure()
+    size = round(min(max(raw_size, BTC_15M_MIN_BET), BTC_15M_MAX_BET, exposure_room), 2)
+
+    closes_at        = market.get("closes_at") or (
+        datetime.now(timezone.utc) + timedelta(seconds=BTC_15M_TTL)).isoformat()
+    market_closes_at = closes_at
+    mode_tag         = "BTC 15m LIVE" if BTC_15M_LIVE_MODE else "BTC 15m PAPER"
+
+    poly_order_id = ""
+    if BTC_15M_LIVE_MODE:
+        poly_order_id = _btc_live_order(direction, market, price, size)
+        if not poly_order_id:
+            log.warning("[BTC 15m LIVE] Order not confirmed — trade not recorded")
+            return
+
+    msg = (
+        f"[{mode_tag}] OPEN | {direction} @ ${btc_price:,.0f}\n"
+        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"  Break-even WR: {round(price * 100, 1)}%\n"
+        f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
+        f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
+        f"  spread={spread:.3f}  confidence={confidence:.3f}  tf={tf:.2f}\n"
+        f"  Market: {market.get('title', 'N/A')}\n"
+        f"  Polymarket resolves: {market_closes_at[:19]} UTC\n"
+        f"  DO NOT sell manually — wait for oracle auto-payout"
+    )
+    log.info(msg)
+    send_alert(msg, priority="high")
+
+    opened_at = datetime.now(timezone.utc).isoformat()
+    trade = {
+        "id":             f"btc15m_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+        "timeframe":      "15m",
+        "opened_at":      opened_at,
+        "closes_at":      closes_at,
+        "direction":      direction,
+        "entry_price":    price,
+        "btc_entry":      btc_price,
+        "btc_exit":       None,
+        "p":              win_prob,
+        "p_trend":        p_trend,
+        "p_level":        p_level,
+        "p_momentum":     p_momentum,
+        "p_reversal":     p_reversal,
+        "p_funding":      p_funding,
+        "p_oi":           p_oi,
+        "spread":         spread,
+        "confidence":     confidence,
+        "time_factor":    round(tf, 3),
+        "ev":             round(ev, 4),
+        "size":           size,
+        "market_id":      market.get("market_id"),
+        "market_title":   market.get("title", ""),
+        "yes_token_id":   market.get("token_id"),
+        "market_closes_at": market_closes_at,
+        "poly_order_id":  poly_order_id,
+        "status":         "open",
+        "won":            None,
+        "pnl":            None,
+    }
+    trades = _load_btc_15m_trades()
+    trades.append(trade)
+    _save_btc_15m_trades(trades)
+
+
+def run_btc_15m_scan():
+    """
+    BTC 15-minute scanner. Called from main.py every 4 minutes, same
+    cadence as the 5m scanner. Targets markets with 5-12 min remaining.
+    """
+    log.info("--- BTC 15m Scan ---")
+
+    btc_price = _update_btc_price()
+    if btc_price is None:
+        log.warning("[BTC 15m] no price available — skipping scan")
+        return
+
+    _close_expired_15m_trades(btc_price)
+
+    trades = _load_btc_15m_trades()
+
+    hourly = _btc_15m_trades_this_hour()
+    if hourly >= MAX_15M_TRADES_PER_HOUR:
+        log.info(f"[BTC 15m] hourly cap {hourly}/{MAX_15M_TRADES_PER_HOUR} — skip")
+        return
+
+    exposure = _btc_15m_exposure()
+    if exposure >= MAX_15M_EXPOSURE_USD:
+        log.info(f"[BTC 15m] exposure ${exposure:.2f} >= ${MAX_15M_EXPOSURE_USD:.2f} — skip")
+        return
+
+    open_count = sum(1 for t in trades if t.get("status") == "open")
+    if open_count >= 3:
+        log.info(f"[BTC 15m] {open_count} trades already open — skip")
+        return
+
+    candles = _fetch_btc_candles(30)
+    market  = _find_btc_15m_market()
+    if market is None:
+        return
+
+    signal = _momentum_signal()
+    if signal != "NONE":
+        _enter_btc_15m_trade(signal, market, btc_price, candles)
+
+
 def run_crypto_scan():
     """
     Main entry point. Called from main.py every 4 minutes.
@@ -2487,8 +3569,9 @@ def run_crypto_scan():
         log.info(f"BTC 5m: HALTED until {halt_until} UTC — 5 consecutive losses limit")
         return
 
-    # Re-evaluate streak using only today's trades.
-    streak = _consecutive_losses(trades, since_date=today_str)
+    # Re-evaluate streak using only today's trades, and only after any prior halt expired.
+    streak_reset_at = _load_store().get("streak_reset_at")
+    streak = _consecutive_losses(trades, since_date=today_str, since_iso=streak_reset_at)
     if streak >= MAX_CONSECUTIVE_LOSSES:
         _set_halt()
         halt_until = _load_store().get("halt_until", "")[:19]
@@ -2521,6 +3604,16 @@ def run_crypto_scan():
     market  = _find_btc_5m_market()
     if market is None:
         return
+
+    # Final expiry guard — defence-in-depth against stale markets slipping through the finder
+    _mc = market.get("closes_at")
+    if _mc:
+        try:
+            if datetime.fromisoformat(_mc) <= datetime.now(timezone.utc):
+                log.warning(f"[BTC GUARD] Market window already closed ({_mc[:19]}) — skipping entry")
+                return
+        except Exception:
+            pass
 
     signal = _momentum_signal()
     if signal != "NONE":

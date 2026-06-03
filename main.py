@@ -7,7 +7,9 @@ from config import (ACTIVE_CITIES, SCAN_INTERVAL, PAPER_MODE,
 from state import send_alert, load_calibration
 from scanner import scan_and_update, clear_stale_positions, drain_priority_queue
 from learning import print_learn_report
-from crypto_scanner import run_crypto_scan, run_sol_scan, monitor_btc_open_trades
+from crypto_scanner import (run_crypto_scan, run_sol_scan, monitor_btc_open_trades,
+                             run_btc_15m_scan, run_sol_15m_scan)
+from btc_1h_bot import run_1h_bot_loop, print_1h_status
 
 CRYPTO_SCAN_INTERVAL   = 120  # 2 minutes
 PRIORITY_CHECK_INTERVAL = 30   # seconds between priority-queue polls during sleep
@@ -130,11 +132,74 @@ def print_status():
     else:
         print(f"  SOL P&L       : n/a  (no settled trades yet)")
 
+    # ── BTC 15m trades (btc_15m_trades.json) ─────────────────
+    btc15_pnl = 0.0
+    btc15_settled = btc15_wins = 0
+    btc15_open = 0
+    try:
+        from crypto_scanner import BTC_15M_TRADES_FILE, BTC_15M_LIVE_MODE
+        if BTC_15M_TRADES_FILE.exists():
+            trades15  = json.loads(BTC_15M_TRADES_FILE.read_text())
+            trades15  = trades15 if isinstance(trades15, list) else []
+            settled15 = [t for t in trades15 if t.get("won") is not None]
+            btc15_settled = len(settled15)
+            btc15_wins    = sum(1 for t in settled15 if t["won"])
+            btc15_pnl     = sum(t.get("pnl") or 0 for t in settled15)
+            btc15_open    = sum(1 for t in trades15 if t.get("status") == "open")
+            btc15_wr_all  = btc15_wins / btc15_settled if btc15_settled else None
+    except Exception:
+        btc15_wr_all = None
+
+    mode15 = "LIVE" if (btc15_settled >= 0 and
+                        os.getenv("BTC_15M_LIVE_MODE","false").lower()=="true") else "PAPER"
+    print(f"\n  BTC 15-MINUTE  ({mode15})")
+    print(f"  {'─'*56}")
+    if btc15_settled:
+        btc15_losses = btc15_settled - btc15_wins
+        all15_str = f"{btc15_wr_all*100:.1f}%" if btc15_wr_all is not None else "n/a"
+        print(f"  Settled       : {btc15_settled}  |  {btc15_wins}W {btc15_losses}L  |  All WR: {all15_str}")
+        print(f"  Open          : {btc15_open}")
+        print(f"  BTC 15m P&L   : ${btc15_pnl:+.2f}")
+    else:
+        print(f"  BTC 15m P&L   : n/a  (no settled trades yet)")
+
+    # ── SOL 15m trades (sol_15m_trades.json) ─────────────────
+    sol15_pnl     = 0.0
+    sol15_settled = sol15_wins = sol15_open = 0
+    sol15_wr_all  = None
+    try:
+        from crypto_scanner import SOL_15M_TRADES_FILE
+        if SOL_15M_TRADES_FILE.exists():
+            trades_s15  = json.loads(SOL_15M_TRADES_FILE.read_text())
+            trades_s15  = trades_s15 if isinstance(trades_s15, list) else []
+            settled_s15 = [t for t in trades_s15 if t.get("won") is not None]
+            sol15_settled = len(settled_s15)
+            sol15_wins    = sum(1 for t in settled_s15 if t["won"])
+            sol15_pnl     = sum(t.get("pnl") or 0 for t in settled_s15)
+            sol15_open    = sum(1 for t in trades_s15 if t.get("status") == "open")
+            sol15_wr_all  = sol15_wins / sol15_settled if sol15_settled else None
+    except Exception:
+        pass
+
+    mode_s15 = "LIVE" if os.getenv("SOL_15M_LIVE_MODE", "false").lower() == "true" else "PAPER"
+    print(f"\n  SOL 15-MINUTE  ({mode_s15})")
+    print(f"  {'─'*56}")
+    if sol15_settled:
+        sol15_losses = sol15_settled - sol15_wins
+        all_s15_str  = f"{sol15_wr_all*100:.1f}%" if sol15_wr_all is not None else "n/a"
+        print(f"  Settled       : {sol15_settled}  |  {sol15_wins}W {sol15_losses}L  |  All WR: {all_s15_str}")
+        print(f"  Open          : {sol15_open}")
+        print(f"  SOL 15m P&L   : ${sol15_pnl:+.2f}")
+    else:
+        print(f"  SOL 15m P&L   : n/a  (no settled trades yet)")
+
     # ── Grand total ───────────────────────────────────────────
-    grand_total = conv_pnl + btc_pnl + sol_pnl
+    grand_total = conv_pnl + btc_pnl + sol_pnl + btc15_pnl + sol15_pnl
     print(f"\n{'='*60}")
     print(f"  GRAND TOTAL   : ${grand_total:+.2f}"
-          f"   (conv ${conv_pnl:+.2f}  btc ${btc_pnl:+.2f}  sol ${sol_pnl:+.2f})")
+          f"   (conv ${conv_pnl:+.2f}  btc5m ${btc_pnl:+.2f}"
+          f"  btc15m ${btc15_pnl:+.2f}  sol5m ${sol_pnl:+.2f}"
+          f"  sol15m ${sol15_pnl:+.2f})")
     print(f"{'='*60}")
 
 def _crypto_edge_table(coin_label: str, trades: list, buckets: list):
@@ -239,15 +304,51 @@ def print_report():
     except Exception:
         pass
 
-    grand_total = total + btc_pnl + sol_pnl
+    # ── BTC 15m P&L (btc_15m_trades.json) ────────────────────
+    btc15_pnl = 0.0
+    btc15_settled = 0
+    btc15_all = []
+    try:
+        from crypto_scanner import BTC_15M_TRADES_FILE
+        if BTC_15M_TRADES_FILE.exists():
+            raw15       = json.loads(BTC_15M_TRADES_FILE.read_text())
+            btc15_all   = [t for t in (raw15 if isinstance(raw15, list) else [])
+                           if t.get("won") is not None]
+            btc15_settled = len(btc15_all)
+            btc15_pnl   = sum(t.get("pnl") or 0 for t in btc15_all)
+    except Exception:
+        pass
+
+    # ── SOL 15m P&L (sol_15m_trades.json) ────────────────────
+    sol15_pnl = 0.0
+    sol15_settled = 0
+    sol15_all = []
+    try:
+        from crypto_scanner import SOL_15M_TRADES_FILE
+        if SOL_15M_TRADES_FILE.exists():
+            raw_s15     = json.loads(SOL_15M_TRADES_FILE.read_text())
+            sol15_all   = [t for t in (raw_s15 if isinstance(raw_s15, list) else [])
+                           if t.get("won") is not None]
+            sol15_settled = len(sol15_all)
+            sol15_pnl   = sum(t.get("pnl") or 0 for t in sol15_all)
+    except Exception:
+        pass
+
+    grand_total = total + btc_pnl + sol_pnl + btc15_pnl + sol15_pnl
     print(f"{'='*75}")
     print(f"  Conviction  : ${total:+.2f}  ({len(all_m)} trades)")
     if btc_settled:
         btc_wins = sum(1 for t in btc_all if t["won"])
         print(f"  BTC 5m      : ${btc_pnl:+.2f}  ({btc_settled} settled  {btc_wins}W {btc_settled-btc_wins}L)")
+    if btc15_settled:
+        btc15_wins = sum(1 for t in btc15_all if t["won"])
+        print(f"  BTC 15m     : ${btc15_pnl:+.2f}  ({btc15_settled} settled  {btc15_wins}W {btc15_settled-btc15_wins}L)")
     if sol_settled:
         sol_wins = sum(1 for t in sol_all if t["won"])
         print(f"  SOL 5m      : ${sol_pnl:+.2f}  ({sol_settled} settled  {sol_wins}W {sol_settled-sol_wins}L)")
+    if sol15_settled:
+        sol15_wins = sum(1 for t in sol15_all if t["won"])
+        print(f"  SOL 15m     : ${sol15_pnl:+.2f}  ({sol15_settled} settled  {sol15_wins}W {sol15_settled-sol15_wins}L)")
     print(f"  GRAND TOTAL : ${grand_total:+.2f}")
     print(f"{'='*75}\n")
 
@@ -261,9 +362,13 @@ def print_report():
         ("30-50¢", 0.30, 0.50, 40.0),
     ]
     if btc_settled:
-        _crypto_edge_table("BTC", btc_all, BTC_BUCKETS)
+        _crypto_edge_table("BTC 5m", btc_all, BTC_BUCKETS)
+    if btc15_settled:
+        _crypto_edge_table("BTC 15m", btc15_all, BTC_BUCKETS)
     if sol_settled:
-        _crypto_edge_table("SOL", sol_all, SOL_BUCKETS)
+        _crypto_edge_table("SOL 5m", sol_all, SOL_BUCKETS)
+    if sol15_settled:
+        _crypto_edge_table("SOL 15m", sol15_all, SOL_BUCKETS)
 
 def _in_rapid_window():
     return RAPID_START_UTC <= datetime.now(timezone.utc).hour < RAPID_END_UTC
@@ -303,6 +408,12 @@ if __name__ == "__main__":
             print("SOL loss-streak halt cleared.")
         else:
             print("No SOL trades file found.")
+    elif arg == "1h":
+        run_1h_bot_loop(paper_test=False)
+    elif arg == "1h-paper-test":
+        run_1h_bot_loop(paper_test=True)
+    elif arg == "1h-status":
+        print_1h_status()
     elif arg == "scan":
         scan_and_update()
     elif arg == "reset":
@@ -400,4 +511,18 @@ if __name__ == "__main__":
                             stopped = True
                         except Exception as e:
                             log.error(f"SOL scan error: {e}", exc_info=True)
+                        try:
+                            run_btc_15m_scan()
+                        except KeyboardInterrupt:
+                            log.info("Stopped.")
+                            stopped = True
+                        except Exception as e:
+                            log.error(f"BTC 15m scan error: {e}", exc_info=True)
+                        try:
+                            run_sol_15m_scan()
+                        except KeyboardInterrupt:
+                            log.info("Stopped.")
+                            stopped = True
+                        except Exception as e:
+                            log.error(f"SOL 15m scan error: {e}", exc_info=True)
                     last_crypto = time.monotonic()
