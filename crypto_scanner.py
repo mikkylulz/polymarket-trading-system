@@ -100,9 +100,9 @@ _sol_15m_ids_loaded:     bool = False
 
 # ── BTC 15-minute scanner constants ───────────────────────────
 BTC_15M_LIVE_MODE = os.getenv("BTC_15M_LIVE_MODE", "false").lower() == "true"
-BTC_15M_MIN_BET   = 2.0
-BTC_15M_MAX_BET   = 2.0
-BTC_15M_BASE      = 2.0
+BTC_15M_MIN_BET   = 1.0
+BTC_15M_MAX_BET   = 1.0
+BTC_15M_BASE      = 1.0
 BTC_15M_TTL       = 900   # 15-minute window
 BTC_15M_TRADES_FILE        = BASE / "data" / "btc_15m_trades.json"
 MAX_15M_TRADES_PER_HOUR    = 4
@@ -3490,6 +3490,7 @@ def _enter_btc_15m_trade(direction: str, market: dict,
 
     poly_order_id = ""
     if BTC_15M_LIVE_MODE:
+        log.info(f"[BTC 15m LIVE] entering {direction} @ {price:.3f} size=${size:.2f} → placing FOK order")
         poly_order_id = _btc_live_order(direction, market, price, size)
         if not poly_order_id:
             log.warning("[BTC 15m LIVE] Order not confirmed — trade not recorded")
@@ -3569,6 +3570,10 @@ def run_btc_15m_scan():
             f"[BTC 15m] dedup set loaded: {len(_open_btc_15m_token_ids)} open position(s)  "
             f"({_dupe_windows} historic windows had duplicate entries)"
         )
+        if BTC_15M_LIVE_MODE:
+            log.info(f"[BTC 15m] LIVE MODE ACTIVE | trade size ${BTC_15M_MAX_BET:.2f}")
+        else:
+            log.info(f"[BTC 15m] PAPER MODE | trade size ${BTC_15M_MAX_BET:.2f} (paused from live)")
         _btc_15m_ids_loaded = True
 
     log.info("--- BTC 15m Scan ---")
