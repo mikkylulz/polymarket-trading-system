@@ -334,7 +334,19 @@ def print_report():
     except Exception:
         pass
 
-    grand_total = total + btc_pnl + sol_pnl + btc15_pnl + sol15_pnl
+    # ── Elon tweet bot P&L ────────────────────────────────────────
+    elon_pnl = 0.0
+    try:
+        from elon_tweet_bot import ELON_DATA_FILE
+        if ELON_DATA_FILE.exists():
+            elon_raw = json.loads(ELON_DATA_FILE.read_text())
+            elon_closed = [t for t in (elon_raw if isinstance(elon_raw, list) else [])
+                           if t.get("status") == "closed" and t.get("pnl") is not None]
+            elon_pnl = sum(t.get("pnl") or 0 for t in elon_closed)
+    except Exception:
+        elon_closed = []
+
+    grand_total = total + btc_pnl + sol_pnl + btc15_pnl + sol15_pnl + elon_pnl
     print(f"{'='*75}")
     print(f"  Conviction  : ${total:+.2f}  ({len(all_m)} trades)")
     if btc_settled:
@@ -349,6 +361,9 @@ def print_report():
     if sol15_settled:
         sol15_wins = sum(1 for t in sol15_all if t["won"])
         print(f"  SOL 15m     : ${sol15_pnl:+.2f}  ({sol15_settled} settled  {sol15_wins}W {sol15_settled-sol15_wins}L)")
+    if elon_closed:
+        elon_wins = sum(1 for t in elon_closed if (t.get("pnl") or 0) > 0)
+        print(f"  Elon tweets : ${elon_pnl:+.2f}  ({len(elon_closed)} settled  {elon_wins}W {len(elon_closed)-elon_wins}L)")
     print(f"  GRAND TOTAL : ${grand_total:+.2f}")
     print(f"{'='*75}\n")
 
@@ -414,6 +429,12 @@ if __name__ == "__main__":
         run_1h_bot_loop(paper_test=True)
     elif arg == "1h-status":
         print_1h_status()
+    elif arg == "elon":
+        from elon_tweet_bot import run as run_elon
+        run_elon()
+    elif arg == "elon-status":
+        from elon_tweet_bot import print_elon_status
+        print_elon_status()
     elif arg == "scan":
         scan_and_update()
     elif arg == "reset":
@@ -431,13 +452,22 @@ if __name__ == "__main__":
     else:
         clear_stale_positions()
 
-        btc_mode = "LIVE" if BTC_LIVE_MODE else "PAPER"
+        from crypto_scanner import (BTC_15M_LIVE_MODE as _btc15_live,
+                                     SOL_LIVE_MODE     as _sol_live,
+                                     SOL_15M_LIVE_MODE as _sol15_live)
+        btc_mode   = "LIVE" if BTC_LIVE_MODE else "PAPER"
+        btc15_mode = "LIVE" if _btc15_live   else "PAPER"
+        sol_mode   = "LIVE" if _sol_live     else "PAPER"
+        sol15_mode = "LIVE" if _sol15_live   else "PAPER"
         log.info(f"WeatherBet Ultimate starting -- BTC-ONLY MODE (weather paused)")
-        log.info(f"[BTC] Mode: {btc_mode}")
+        log.info(f"  BTC  5m : {btc_mode}  |  BTC 15m: {btc15_mode}  |  "
+                 f"SOL  5m : {sol_mode}  |  SOL 15m: {sol15_mode}")
         send_alert(
-            f"WeatherBot started — BTC-ONLY MODE\n"
-            f"Weather scanner: PAUSED\n"
-            f"BTC Scanner: {btc_mode}"
+            f"WeatherBot started\n"
+            f"BTC  5m : {btc_mode}\n"
+            f"BTC 15m : {btc15_mode}  ← LIVE $1/trade\n"
+            f"SOL  5m : {sol_mode}\n"
+            f"SOL 15m : {sol15_mode}"
         )
 
         WEATHER_PAUSED = True   # weather scanner paused — BTC only mode

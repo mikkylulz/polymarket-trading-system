@@ -98,6 +98,11 @@ _btc_15m_ids_loaded:     bool = False
 _open_sol_15m_token_ids: set = set()
 _sol_15m_ids_loaded:     bool = False
 
+# ── BTC 15m candle cache ───────────────────────────────────────────────────────
+_btc_15m_candles_cache:    list  = []
+_btc_15m_candles_mono:     float = 0.0
+BTC_15M_CANDLES_TTL               = 60   # seconds
+
 # ── BTC 15-minute scanner constants ───────────────────────────
 BTC_15M_LIVE_MODE = os.getenv("BTC_15M_LIVE_MODE", "false").lower() == "true"
 BTC_15M_MIN_BET   = 1.0
@@ -3411,6 +3416,232 @@ def _close_expired_15m_trades(current_btc_price: float):
         _save_btc_15m_trades(trades)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BTC 15m-CALIBRATED MODULE FUNCTIONS
+# These replace the 5m modules inside _enter_btc_15m_trade only.
+# The 5m scanner (_enter_trade) is completely untouched.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_btc_15m_candles(limit: int = 50) -> Optional[list]:
+    """Fetch and cache BTC 15-minute candles from Binance (60s TTL).
+
+    Returns list of dicts with keys: open, high, low, close, volume.
+    Returns None on any fetch error so callers can fall back gracefully.
+    """
+    global _btc_15m_candles_cache, _btc_15m_candles_mono
+    now_mono = time.monotonic()
+    if now_mono - _btc_15m_candles_mono < BTC_15M_CANDLES_TTL and _btc_15m_candles_cache:
+        return _btc_15m_candles_cache
+    try:
+        r = requests.get(
+            BINANCE_KLINES,
+            params={"symbol": "BTCUSDT", "interval": "15m", "limit": limit},
+            timeout=12,
+        )
+        r.raise_for_status()
+        candles = [
+            {"open": float(c[1]), "high": float(c[2]),
+             "low":  float(c[3]), "close": float(c[4]), "volume": float(c[5])}
+            for c in r.json()
+        ]
+        _btc_15m_candles_cache = candles
+        _btc_15m_candles_mono  = now_mono
+        oldest_h = len(candles) * 0.25          # each candle = 15 min = 0.25 h
+        log.info(
+            f"[BTC 15m CANDLES] fetched {len(candles)} candles, "
+            f"latest close=${candles[-1]['close']:,.2f}, "
+            f"oldest {oldest_h:.1f}h ago"
+        )
+        return candles
+    except Exception as e:
+        log.warning(f"[BTC 15m CANDLES] fetch failed: {e} — will use fallback modules")
+        return None
+
+
+def _ema(values: list, period: int) -> Optional[float]:
+    """Exponential moving average of the last `period` values.  Returns None if
+    fewer values than period are available."""
+    if len(values) < period:
+        return None
+    k   = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def _module_trend_15m(candles_15m: list, current_price: float) -> float:
+    """Module 1 — Trend using 15m candles.
+
+    EMA5  of 15m closes  = 75-minute context
+    EMA15 of 15m closes  = 225-minute (3.75h) context
+    VWAP  of 15m candles = session average price
+
+    Signals:
+      price > EMA5 > EMA15 and > VWAP → strong UP
+      price < EMA5 < EMA15 and < VWAP → strong DOWN
+      mixed                            → neutral
+    """
+    if len(candles_15m) < 15:
+        log.info("[BTC 15m TREND] insufficient candles — neutral 0.500")
+        return 0.50
+    closes = [c["close"] for c in candles_15m]
+    ema5   = _ema(closes, 5)
+    ema15  = _ema(closes, 15)
+    vwap   = _vwap(candles_15m)
+
+    if ema5 is None or ema15 is None or vwap is None:
+        return 0.50
+
+    above_ema5  = current_price > ema5
+    above_ema15 = current_price > ema15
+    above_vwap  = current_price > vwap
+    ema5_above15 = ema5 > ema15
+
+    score = sum([above_ema5, above_ema15, above_vwap, ema5_above15])
+    # 4 signals → 0.75, 3 → 0.65, 2 → 0.50, 1 → 0.35, 0 → 0.25
+    p_map = {4: 0.75, 3: 0.65, 2: 0.50, 1: 0.35, 0: 0.25}
+    p_trend = p_map[score]
+
+    log.info(
+        f"[BTC 15m TREND] EMA5_15m={ema5:,.0f} EMA15_15m={ema15:,.0f} "
+        f"VWAP_15m={vwap:,.0f} price={current_price:,.0f} "
+        f"score={score}/4 → p_trend={p_trend:.3f}"
+    )
+    return p_trend
+
+
+def _module_level_15m(candles_15m: list, current_price: float) -> float:
+    """Module 2 — Support/Resistance using 4-hour range from 15m candles.
+
+    Uses last 16 candles × 15 min = 4 hours of price context.
+    Near 4h low  → bounce zone → UP bias (high p_level)
+    Near 4h high → resistance  → DOWN bias (low p_level)
+    """
+    window = candles_15m[-16:] if len(candles_15m) >= 16 else candles_15m
+    if not window:
+        return 0.50
+
+    hi_4h = max(c["high"]  for c in window)
+    lo_4h = min(c["low"]   for c in window)
+    rng   = hi_4h - lo_4h
+
+    if rng < 1.0:
+        log.info(f"[BTC 15m LEVELS] 4h range too tight (${rng:.0f}) — neutral 0.500")
+        return 0.50
+
+    pos = (current_price - lo_4h) / rng        # 0 = at low, 1 = at high
+
+    # Round-number proximity (nearest $1000 level)
+    nearest_round = round(current_price / 1000) * 1000
+    dist_pct = abs(current_price - nearest_round) / current_price
+
+    # Close to 4h low (pos < 0.25) → favour UP (price may bounce)
+    # Close to 4h high (pos > 0.75) → favour DOWN (price may reject)
+    # Round-number proximity boosts the relevant signal slightly
+    if pos < 0.25:
+        p_level = 0.68 if dist_pct < 0.003 else 0.63
+    elif pos > 0.75:
+        p_level = 0.32 if dist_pct < 0.003 else 0.37
+    elif pos < 0.40:
+        p_level = 0.57
+    elif pos > 0.60:
+        p_level = 0.43
+    else:
+        p_level = 0.50
+
+    log.info(
+        f"[BTC 15m LEVELS] 4h_hi={hi_4h:,.0f} 4h_lo={lo_4h:,.0f} "
+        f"pos={pos:.2f} round={nearest_round:,} dist={dist_pct:.4f} "
+        f"→ p_level={p_level:.3f}"
+    )
+    return p_level
+
+
+def _module_momentum_15m(prices: list) -> float:
+    """Module 3 — Live Momentum calibrated for 15m markets.
+
+    Uses last 10 price readings (1-min spacing ≈ 10 min of recent data).
+    Wider thresholds than 5m version to reduce noise on a 15-min outcome.
+
+    Tiers:
+      >= +0.30%  → 0.68  (strong UP)
+      >= +0.15%  → 0.57  (mild UP)
+      -0.15% to +0.15% → 0.50 (flat)
+      <= -0.15%  → 0.43  (mild DOWN)
+      <  -0.30%  → 0.32  (strong DOWN)
+    """
+    window = [p for _, p in prices[-10:]] if prices else []
+    if len(window) < 2:
+        log.info("[BTC 15m MOMENTUM] insufficient history — neutral 0.500")
+        return 0.50
+    pct = (window[-1] - window[0]) / window[0] * 100
+    if   pct >= 0.30:  p, label = 0.68, "strong UP"
+    elif pct >= 0.15:  p, label = 0.57, "mild UP"
+    elif pct >= -0.15: p, label = 0.50, "flat"
+    elif pct >= -0.30: p, label = 0.43, "mild DOWN"
+    else:              p, label = 0.32, "strong DOWN"
+    sign = "+" if pct >= 0 else ""
+    log.info(
+        f"[BTC 15m MOMENTUM] price_change={sign}{pct:.3f}% "
+        f"→ p_momentum={p:.3f} → signal={label}"
+    )
+    return p
+
+
+def _module_reversal_15m(candles_15m: list, current_price: float) -> float:
+    """Module 6 — Reversal/Exhaustion using 15m candle data.
+
+    RSI(14) on 15m closes, VWAP distance from 15m VWAP, and consecutive
+    same-direction 15m candles (threshold 5).
+
+    Triggers on ANY of:
+      RSI > 60 OR VWAP_dist > +0.8% OR 5+ consec UP 15m candles → 0.30 (DOWN coming)
+      RSI < 40 OR VWAP_dist < -0.8% OR 5+ consec DN 15m candles → 0.70 (UP coming)
+      Otherwise → 0.50 neutral
+    """
+    if len(candles_15m) < 15:
+        log.info(f"[BTC 15m REVERSAL] insufficient candles ({len(candles_15m)}) — neutral 0.500")
+        return 0.50
+
+    closes    = [c["close"] for c in candles_15m]
+    rsi       = _rsi(closes, 14)
+    vwap      = _vwap(candles_15m)
+    vwap_dist = ((current_price - vwap) / vwap * 100.0) if vwap else 0.0
+
+    recent = candles_15m[-10:]
+    consec_up = consec_dn = 0
+    last_up: Optional[bool] = None
+    for c in reversed(recent):
+        is_up = c["close"] >= c["open"]
+        if last_up is None:
+            last_up = is_up
+        if is_up == last_up and is_up:
+            consec_up += 1
+        elif is_up == last_up and not is_up:
+            consec_dn += 1
+        else:
+            break
+
+    overbought = (rsi is not None and rsi > 60) or vwap_dist > 0.8  or consec_up >= 5
+    oversold   = (rsi is not None and rsi < 40) or vwap_dist < -0.8 or consec_dn >= 5
+
+    if overbought:
+        p, signal = 0.30, "DOWN coming"
+    elif oversold:
+        p, signal = 0.70, "UP coming"
+    else:
+        p, signal = 0.50, "neutral"
+
+    rsi_str    = f"{rsi:.1f}" if rsi is not None else "n/a"
+    consec_str = (f"consec_up={consec_up}" if consec_up > consec_dn else f"consec_dn={consec_dn}")
+    log.info(
+        f"[BTC 15m REVERSAL] rsi_15m={rsi_str} vwap_dist_15m={vwap_dist:+.2f}% "
+        f"{consec_str} → p_reversal={p:.2f} ({signal})"
+    )
+    return p
+
+
 def _enter_btc_15m_trade(direction: str, market: dict,
                           btc_price: float, candles: list):
     """Open a BTC 15-minute paper or live trade. Reuses all six 5m modules."""
@@ -3421,11 +3652,28 @@ def _enter_btc_15m_trade(direction: str, market: dict,
         log.info(f"[BTC 15m SKIP] token_id ...{token_id[-12:]} already has open position — skipping")
         return
 
-    # ── Six-module signal stack (identical to 5m, tag = BTC 15m) ─
-    p_trend    = _module_trend(candles)
-    p_level    = _module_levels(btc_price, candles)
-    p_momentum = _module_momentum(_btc_prices)
-    p_reversal = _module_reversal(candles, "BTC 15m")
+    # ── Time-of-day filter (diagnostic: 12-16 UTC = 38.7% WR) ─────
+    _utc_hour = datetime.now(timezone.utc).hour
+    if 12 <= _utc_hour < 16:
+        log.info(f"[BTC 15m TIME FILTER] UTC hour {_utc_hour} in weak window (12-16 UTC) — skipping entry")
+        return
+
+    # ── Six-module signal stack — 15m-calibrated modules ──────────
+    candles_15m = _fetch_btc_15m_candles()
+    if candles_15m is None:
+        log.info("[BTC 15m FALLBACK] 15m candle data unavailable, using 5m modules")
+        p_trend    = _module_trend(candles)
+        p_level    = _module_levels(btc_price, candles)
+        p_momentum = _module_momentum(_btc_prices)
+        p_reversal = _module_reversal(candles, "BTC 15m")
+        modules_calibration = "5m_fallback"
+    else:
+        log.info("[BTC 15m MODULES] using 15m-calibrated signals")
+        p_trend    = _module_trend_15m(candles_15m, btc_price)
+        p_level    = _module_level_15m(candles_15m, btc_price)
+        p_momentum = _module_momentum_15m(_btc_prices)
+        p_reversal = _module_reversal_15m(candles_15m, btc_price)
+        modules_calibration = "15m"
 
     p_funding, funding_adj = _module_funding(direction)
     p_oi, oi_conf_adj      = _module_oi(direction)
@@ -3534,12 +3782,14 @@ def _enter_btc_15m_trade(direction: str, market: dict,
         "size":           size,
         "market_id":      market.get("market_id"),
         "market_title":   market.get("title", ""),
-        "yes_token_id":   market.get("token_id"),
-        "market_closes_at": market_closes_at,
-        "poly_order_id":  poly_order_id,
-        "status":         "open",
-        "won":            None,
-        "pnl":            None,
+        "yes_token_id":        market.get("token_id"),
+        "market_closes_at":    market_closes_at,
+        "poly_order_id":       poly_order_id,
+        "modules_calibration": modules_calibration,
+        "time_filter_active":  True,
+        "status":              "open",
+        "won":                 None,
+        "pnl":                 None,
     }
     if token_id:
         _open_btc_15m_token_ids.add(token_id)
