@@ -1603,8 +1603,8 @@ def _enter_trade(direction: str, market: dict, btc_price: float, candles: list):
             return
 
     msg = (
-        f"{mode_tag} BTC 5m OPEN | {direction} @ ${btc_price:,.0f}\n"
-        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"{mode_tag} BTC 5m OPEN | {direction} @ {price:.3f} Poly\n"
+        f"  BTC:${btc_price:,.0f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
         f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
@@ -2680,8 +2680,8 @@ def _enter_sol_trade(direction: str, market: dict, sol_price: float, candles: li
             return
 
     msg = (
-        f"[{mode_tag}] OPEN | {direction} @ ${sol_price:,.2f}\n"
-        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"[{mode_tag}] OPEN | {direction} @ {price:.3f} Poly\n"
+        f"  SOL:${sol_price:,.2f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
         f"  EV tier: {'≤0.30 → min 0.15' if price <= 0.30 else '≤0.50 → min 0.08'}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
@@ -3091,8 +3091,8 @@ def _enter_sol_15m_trade(direction: str, market: dict,
             return
 
     msg = (
-        f"[{mode_tag}] OPEN | {direction} @ ${sol_price:.2f}\n"
-        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"[{mode_tag}] OPEN | {direction} @ {price:.3f} Poly\n"
+        f"  SOL:${sol_price:.2f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
         f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
@@ -3745,8 +3745,8 @@ def _enter_btc_15m_trade(direction: str, market: dict,
             return
 
     msg = (
-        f"[{mode_tag}] OPEN | {direction} @ ${btc_price:,.0f}\n"
-        f"  Poly price:{price:.3f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
+        f"[{mode_tag}] OPEN | {direction} @ {price:.3f} Poly\n"
+        f"  BTC:${btc_price:,.0f} | win_p:{win_prob:.3f} | EV:{ev:.4f} | Size:${size:.2f}\n"
         f"  Break-even WR: {round(price * 100, 1)}%\n"
         f"  trend={p_trend:.3f}  level={p_level:.3f}  momentum={p_momentum:.3f}\n"
         f"  reversal={p_reversal:.3f}  funding={p_funding:.3f}  oi={p_oi:.3f}\n"
