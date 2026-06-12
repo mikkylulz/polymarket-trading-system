@@ -43,7 +43,7 @@ MIN_ENTRY_PRICE        = 0.10    # no entry below 10c
 MAX_ENTRY_PRICE        = 0.70    # no entry above 70c
 MAX_OPEN_TRADES        = 3       # concurrent open 1h positions
 MAX_DAILY_TRADES       = 18      # per-UTC-day cap
-TRADE_SIZE_USD         = 2.00
+TRADE_SIZE_USD         = 1.00
 SCAN_INTERVAL_SEC      = 60      # main.py calls run_1h_scan() every 60 s
 DEFAULT_VOL_PCT        = 0.45    # fallback hourly vol when history is thin (%)
 
@@ -578,7 +578,27 @@ def _resolve_trades(current_price: float):
 
         strike    = t.get("strike_price", 0.0)
         direction = t.get("direction", "UP")
-        won       = (current_price > strike) if direction == "YES" else (current_price <= strike)
+
+        if t.get("poly_order_id"):
+            # LIVE: settle on the actual Polymarket oracle outcome — that is
+            # what pays out, and it can differ from Binance near the strike.
+            # t["token_id"] is the token we actually bought (YES or NO), so
+            # the midpoint query answers "did my token win" directly.
+            from crypto_scanner import _query_poly_resolution, _query_gamma_resolution
+            won = _query_poly_resolution(t.get("token_id", ""))
+            if won is None:
+                yes_won = _query_gamma_resolution(str(t.get("market_id", "")))
+                if yes_won is not None:
+                    won = yes_won if direction == "YES" else not yes_won
+            if won is None:
+                if now_utc < close_ts + timedelta(minutes=10):
+                    log.info("[1H LIVE] Oracle not resolved yet — rechecking next scan")
+                    continue
+                log.warning("[1H LIVE] Oracle unavailable 10 min after close — "
+                            "falling back to Binance strike comparison")
+                won = (current_price > strike) if direction == "YES" else (current_price <= strike)
+        else:
+            won = (current_price > strike) if direction == "YES" else (current_price <= strike)
         entry     = t.get("entry_price", 0.5)
         size      = t.get("size", TRADE_SIZE_USD)
         pnl       = round(size * (1.0 / entry - 1) if won else -size, 2)

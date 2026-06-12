@@ -1,7 +1,8 @@
-import json, logging, requests, time
+import json, logging, math, requests, time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
-from config import (LOCATIONS, ACTIVE_CITIES, LIVE_CITIES, MIN_HOURS, MAX_HOURS, MIN_VOLUME,
+from config import (LOCATIONS, ACTIVE_CITIES, SHADOW_CITIES, LIVE_CITIES,
+                    MIN_HOURS, MAX_HOURS, MIN_VOLUME,
                     BALANCE, STOP_LOSS, TP1_PCT, TP1_SIZE, TP2_PCT, PAPER_MODE,
                     VC_KEY, MARKETS_DIR, RAPID_SCAN_CITIES, MAX_BUCKET_DISTANCE,
                     RAPID_END_UTC, MARKET_CORRELATIONS)
@@ -47,6 +48,9 @@ _PRIORITY_RATE_LIMIT: float = 3600.0  # max one priority re-scan per city per ho
 # ── Conviction mode constants (config-driven) ─────────────────
 from config import CFG as _CFG
 CONVICTION_MIN_EV    = 0.15
+# YES (buying a bucket) went 1/23 in the first 36 resolved trades while NO
+# (fading a bucket) went 8/13 — demand substantially more edge on the YES side.
+CONVICTION_MIN_EV_YES = 0.25
 CONVICTION_SIZES     = _CFG.get("conviction_sizes", [8, 4, 3])
 MAX_DAILY_TRADES     = _CFG.get("max_conviction_trades", 3)
 
@@ -771,9 +775,11 @@ def _apply_conviction_trades(candidates: list, balance: float, exposures: dict):
         blabel    = trade.get("bucket_label") or f"{trade['bucket']}°C"
         best_temp = c.get("best_temp")
 
-        # EV gate
-        if ev < CONVICTION_MIN_EV:
-            log.info(f"  SKIP {c['city']} {direction} {blabel}: EV={ev:.4f} < {CONVICTION_MIN_EV} (threshold)")
+        # EV gate — asymmetric: fading buckets (NO) is the demonstrated edge;
+        # buying buckets (YES) must clear a higher bar.
+        min_ev = CONVICTION_MIN_EV if direction == "NO" else CONVICTION_MIN_EV_YES
+        if ev < min_ev:
+            log.info(f"  SKIP {c['city']} {direction} {blabel}: EV={ev:.4f} < {min_ev} (threshold)")
             continue
 
         # Low-price conviction gate — sub-35¢ entries allowed only when the
@@ -931,6 +937,143 @@ def drain_priority_queue():
             log.info(f"[PRIORITY SCAN] {city} triggered by BIG MOVE — scanned immediately")
         except Exception as e:
             log.error(f"[PRIORITY SCAN] {city} error: {e}", exc_info=True)
+
+
+# ── Shadow mode ───────────────────────────────────────────────
+# Cities without verified station calibration are scanned but never traded.
+# The best candidate per city per date is logged to data/shadow_trades.json
+# and graded against the actual temperature once the archive updates, so a
+# city is promoted to active_cities on evidence (~15 resolved shadow trades
+# with positive simulated P&L), not hope.
+SHADOW_TRADES_FILE = MARKETS_DIR.parent / "shadow_trades.json"
+
+
+def _load_shadow_trades() -> list:
+    if not SHADOW_TRADES_FILE.exists():
+        return []
+    try:
+        data = json.loads(SHADOW_TRADES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_shadow_trades(trades: list):
+    SHADOW_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SHADOW_TRADES_FILE.write_text(json.dumps(trades, indent=2))
+
+
+def _shadow_bucket_hit(label: str, bucket_val: float, actual_c: float) -> bool:
+    """Did the bucket resolve YES given the actual max temp (°C)?
+    Mirrors resolver._match_bucket: half-up rounding in the bucket's own unit,
+    with 'or below' / 'or higher' edge buckets."""
+    actual = actual_c * 9 / 5 + 32 if "°F" in str(label) else actual_c
+    rounded = math.floor(actual + 0.5)
+    low = str(label).lower()
+    if "or below" in low:
+        return rounded <= bucket_val
+    if "or higher" in low:
+        return rounded >= bucket_val
+    return rounded == bucket_val
+
+
+def _resolve_shadow_trades():
+    """Grade past-date shadow entries against actual temps ($1 flat stake)."""
+    from resolver import fetch_actual_temp
+    trades  = _load_shadow_trades()
+    today   = datetime.now(timezone.utc).date().isoformat()
+    changed = False
+    for t in trades:
+        if t.get("status") != "open" or t.get("date", "") >= today:
+            continue
+        actual = fetch_actual_temp(t["city"], t["date"])
+        if not isinstance(actual, (int, float)):
+            continue   # archive lags 2-5 days (or timed out) — retry next scan
+        hit = _shadow_bucket_hit(t.get("bucket_label", ""), t["bucket"], actual)
+        won = hit if t["direction"] == "YES" else not hit
+        t["actual_temp"]    = actual
+        t["forecast_error"] = (round(abs(t["best_temp"] - actual), 2)
+                               if t.get("best_temp") is not None else None)
+        t["won"]    = won
+        t["pnl"]    = round(1.0 / t["price"] - 1.0, 2) if won else -1.0
+        t["status"] = "resolved"
+        changed = True
+        log.info(f"[SHADOW RESOLVED] {t['city']} {t['date']} {t['direction']} "
+                 f"{t.get('bucket_label')} @ {t['price']:.3f} — actual {actual}°C "
+                 f"→ {'WIN' if won else 'LOSS'} (err {t['forecast_error']}°C)")
+    if changed:
+        _save_shadow_trades(trades)
+
+
+def _run_shadow_scan(state, calibration, now):
+    """Log (never trade) the best candidate per shadow city per date."""
+    if not SHADOW_CITIES:
+        return
+    trades = _load_shadow_trades()
+    logged = {(t.get("city"), t.get("date")) for t in trades}
+    added  = 0
+    for city in SHADOW_CITIES:
+        if city not in LOCATIONS:
+            continue
+        for day_offset in (0, 1):
+            target   = now + timedelta(days=day_offset)
+            date_str = target.strftime("%Y-%m-%d")
+            if (city, date_str) in logged:
+                continue
+            end_of_day = datetime(target.year, target.month, target.day,
+                                  23, 59, 59, tzinfo=timezone.utc)
+            hours_left = (end_of_day - now).total_seconds() / 3600
+            if hours_left < MIN_HOURS or hours_left > MAX_HOURS:
+                continue
+            try:
+                event = find_polymarket_event(city, target.month, target.day, target.year)
+                if not event:
+                    continue
+                snap = take_forecast_snapshot(city, date_str, state, rapid_mode=False)
+                if snap is None or snap.get("pressure_skip"):
+                    continue
+                best_temp = snap.get("best_temp")
+                if best_temp is None:
+                    continue
+                conf_mult = snap.get("model_confidence", 1.0)
+                outcomes  = get_market_outcomes(event)
+                sigma     = get_sigma(city, calibration)
+                yes_t = find_yes_trade(city, best_temp, outcomes, sigma, 1.0,
+                                       conf_mult, BALANCE, calibration, 0)
+                no_t  = find_no_trade(city, best_temp, outcomes, sigma, 1.0,
+                                      conf_mult, BALANCE, calibration, 0)
+                trade = max((t for t in (yes_t, no_t) if t),
+                            key=lambda t: t["ev"], default=None)
+                if not trade:
+                    continue
+                trades.append({
+                    "city":         city,
+                    "date":         date_str,
+                    "direction":    trade["direction"],
+                    "bucket":       trade["bucket"],
+                    "bucket_label": trade.get("bucket_label") or f"{trade['bucket']}°C",
+                    "price":        trade["price"],
+                    "ev":           round(trade["ev"], 4),
+                    "p":            round(trade["p"], 4),
+                    "best_temp":    best_temp,
+                    "sigma":        sigma,
+                    "conf":         conf_mult,
+                    "logged_at":    datetime.now(timezone.utc).isoformat(),
+                    "status":       "open",
+                    "actual_temp":  None,
+                    "won":          None,
+                    "pnl":          None,
+                })
+                logged.add((city, date_str))
+                added += 1
+                log.info(f"[SHADOW] {city} {date_str}: {trade['direction']} "
+                         f"{trade.get('bucket_label')} @ {trade['price']:.3f} "
+                         f"EV={trade['ev']:.4f} — logged, NO trade placed")
+            except Exception as e:
+                log.warning(f"[SHADOW] {city} {date_str} failed: {e}")
+    if added:
+        _save_shadow_trades(trades)
+        log.info(f"[SHADOW] {added} new shadow candidate(s) logged")
 
 
 # ── Main scan (enhanced) ─────────────────────────────────────
@@ -1145,6 +1288,25 @@ def scan_and_update(city_filter=None, date_filter=None, rapid_mode=None):
 
                 if cur_p is not None:
                     action = check_stops(mkt, cur_p)
+                    if action == "stop_loss" and best_temp is not None:
+                        # Price stops convert intraday repricing noise into realized
+                        # losses (12 of the first 36 trades died this way). Honor a
+                        # price stop only when the forecast itself has moved against
+                        # the position — otherwise hold to resolution.
+                        _lbl = pos.get("bucket_label", "")
+                        _bucket_c = ((pos["bucket"] - 32) * 5 / 9
+                                     if "°F" in _lbl else float(pos["bucket"]))
+                        _fc_dist = abs(_bucket_c - best_temp)
+                        _fc_against = (_fc_dist > 1.0 if pos["direction"] == "YES"
+                                       else _fc_dist <= 1.0)
+                        if not _fc_against:
+                            log.info(
+                                f"[STOP HELD] {city} {pos['direction']} {_lbl}: price hit stop "
+                                f"({cur_p:.3f} vs entry {pos['price']:.3f}) but forecast "
+                                f"{best_temp:.1f}°C (dist {_fc_dist:.1f}°C) still supports the "
+                                f"position — holding to resolution"
+                            )
+                            action = None
                     if action:
                         # Snapshot preserved so learning tracker can access entry
                         # price and direction after close_position clears position.
@@ -1362,4 +1524,14 @@ def scan_and_update(city_filter=None, date_filter=None, rapid_mode=None):
     state["market_exposures"] = exposures
     save_state(state)
     resolve_past_markets()
+
+    # Shadow pass — uncalibrated cities: log candidates + grade past ones.
+    # Skipped during rapid cycles (122s) to keep them light.
+    if not rapid_mode:
+        try:
+            _resolve_shadow_trades()
+            _run_shadow_scan(state, calibration, now)
+        except Exception as e:
+            log.warning(f"[SHADOW] pass failed: {e}")
+
     log.info("Scan complete.")

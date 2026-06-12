@@ -1358,6 +1358,39 @@ def _query_gamma_resolution(market_id: str) -> Optional[bool]:
     return None
 
 
+def _binance_window_outcome(symbol: str, window_close_iso: str,
+                            window_minutes: int) -> Optional[str]:
+    """Real Up/Down market outcome for the window ENDING at window_close_iso:
+    Binance kline close vs open.  Polymarket resolves these markets on the
+    window's open->close move, NOT on the price move after the bot's
+    mid-window entry.  Returns 'UP' / 'DOWN', or None if the candle is not
+    available yet (window not closed, misaligned timestamp, or fetch failed).
+    """
+    try:
+        close_dt = datetime.fromisoformat(window_close_iso.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) < close_dt:
+            return None
+        open_ms = int((close_dt - timedelta(minutes=window_minutes)).timestamp() * 1000)
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": f"{window_minutes}m",
+                    "startTime": open_ms, "limit": 1},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Exact open-time match guards against a misaligned window_close
+        # (e.g. endDate = oracle resolution time) silently grading the
+        # wrong candle.
+        if not data or int(data[0][0]) != open_ms:
+            return None
+        o, c = float(data[0][1]), float(data[0][4])
+        return "UP" if c >= o else "DOWN"
+    except Exception as e:
+        log.warning(f"[WINDOW OUTCOME] {symbol} window ending {window_close_iso}: {e}")
+        return None
+
+
 # ── Trade lifecycle ───────────────────────────────────────────
 def _close_expired_trades(current_btc_price: float):
     """Resolve any open trades whose 5-minute window has elapsed."""
@@ -1414,9 +1447,22 @@ def _close_expired_trades(current_btc_price: float):
                     won = ((direction == "UP"   and current_btc_price > btc_entry) or
                            (direction == "DOWN" and current_btc_price < btc_entry))
             else:
-                # PAPER: compare BTC price at 5-min TTL expiry
-                won = ((direction == "UP"   and current_btc_price > btc_entry) or
-                       (direction == "DOWN" and current_btc_price < btc_entry))
+                # PAPER: grade exactly like the real market — window close vs
+                # window OPEN, not vs the bot's mid-window entry price.
+                window_close = t.get("market_closes_at") or closes_str
+                outcome = _binance_window_outcome("BTCUSDT", window_close, 5)
+                if outcome is None:
+                    if now_utc < closes_at + timedelta(minutes=10):
+                        log.info("[BTC 5m PAPER] window candle not available yet — rechecking next scan")
+                        continue
+                    log.warning("[BTC 5m PAPER] candle unavailable after grace period — "
+                                "falling back to entry-price grading")
+                    won = ((direction == "UP"   and current_btc_price > btc_entry) or
+                           (direction == "DOWN" and current_btc_price < btc_entry))
+                    t["graded"] = "fallback_entry_cmp"
+                else:
+                    won = (outcome == direction)
+                    t["graded"] = "window_open_close"
 
             entry_price = t["entry_price"]
             size        = t["size"]
@@ -2573,8 +2619,22 @@ def _close_expired_sol_trades(current_sol_price: float):
                     won = ((direction == "UP"   and current_sol_price > sol_entry) or
                            (direction == "DOWN" and current_sol_price < sol_entry))
             else:
-                won = ((direction == "UP"   and current_sol_price > sol_entry) or
-                       (direction == "DOWN" and current_sol_price < sol_entry))
+                # PAPER: grade exactly like the real market — window close vs
+                # window OPEN, not vs the bot's mid-window entry price.
+                window_close = t.get("market_closes_at") or closes_str
+                outcome = _binance_window_outcome("SOLUSDT", window_close, 5)
+                if outcome is None:
+                    if now_utc < closes_at + timedelta(minutes=10):
+                        log.info("[SOL 5m PAPER] window candle not available yet — rechecking next scan")
+                        continue
+                    log.warning("[SOL 5m PAPER] candle unavailable after grace period — "
+                                "falling back to entry-price grading")
+                    won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                           (direction == "DOWN" and current_sol_price < sol_entry))
+                    t["graded"] = "fallback_entry_cmp"
+                else:
+                    won = (outcome == direction)
+                    t["graded"] = "window_open_close"
 
             entry_price = t["entry_price"]
             size        = t["size"]
@@ -2983,8 +3043,22 @@ def _close_expired_sol_15m_trades(current_sol_price: float):
                 won = ((direction == "UP"   and current_sol_price > sol_entry) or
                        (direction == "DOWN" and current_sol_price < sol_entry))
         else:
-            won = ((direction == "UP"   and current_sol_price > sol_entry) or
-                   (direction == "DOWN" and current_sol_price < sol_entry))
+            # PAPER: grade exactly like the real market — window close vs
+            # window OPEN, not vs the bot's mid-window entry price.
+            window_close = t.get("market_closes_at") or closes_str
+            outcome = _binance_window_outcome("SOLUSDT", window_close, 15)
+            if outcome is None:
+                if now_utc < closes_at + timedelta(minutes=10):
+                    log.info("[SOL 15m PAPER] window candle not available yet — rechecking next scan")
+                    continue
+                log.warning("[SOL 15m PAPER] candle unavailable after grace period — "
+                            "falling back to entry-price grading")
+                won = ((direction == "UP"   and current_sol_price > sol_entry) or
+                       (direction == "DOWN" and current_sol_price < sol_entry))
+                t["graded"] = "fallback_entry_cmp"
+            else:
+                won = (outcome == direction)
+                t["graded"] = "window_open_close"
 
         entry_price = t["entry_price"]
         size        = t["size"]
@@ -3387,8 +3461,22 @@ def _close_expired_15m_trades(current_btc_price: float):
                 won = ((direction == "UP"   and current_btc_price > btc_entry) or
                        (direction == "DOWN" and current_btc_price < btc_entry))
         else:
-            won = ((direction == "UP"   and current_btc_price > btc_entry) or
-                   (direction == "DOWN" and current_btc_price < btc_entry))
+            # PAPER: grade exactly like the real market — window close vs
+            # window OPEN, not vs the bot's mid-window entry price.
+            window_close = t.get("market_closes_at") or closes_str
+            outcome = _binance_window_outcome("BTCUSDT", window_close, 15)
+            if outcome is None:
+                if now_utc < closes_at + timedelta(minutes=10):
+                    log.info("[BTC 15m PAPER] window candle not available yet — rechecking next scan")
+                    continue
+                log.warning("[BTC 15m PAPER] candle unavailable after grace period — "
+                            "falling back to entry-price grading")
+                won = ((direction == "UP"   and current_btc_price > btc_entry) or
+                       (direction == "DOWN" and current_btc_price < btc_entry))
+                t["graded"] = "fallback_entry_cmp"
+            else:
+                won = (outcome == direction)
+                t["graded"] = "window_open_close"
 
         entry_price = t["entry_price"]
         size        = t["size"]

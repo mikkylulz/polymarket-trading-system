@@ -25,17 +25,19 @@
   "regime_sizing": true,
   "paper_mode": true,
   "active_cities": [
-    "hong_kong", "singapore", "tokyo", "seoul", "lucknow", "chengdu",
-    "new_york", "taipei", "shanghai", "shenzhen",
+    "hong_kong", "singapore", "tokyo", "seoul"
+  ],
+  "shadow_cities": [
+    "lucknow", "chengdu", "new_york", "taipei", "shanghai", "shenzhen",
     "seattle", "denver", "dallas", "atlanta", "buenos_aires",
     "chicago", "miami", "wellington"
   ],
   "live_cities": ["hong_kong", "singapore", "seoul"],
-  "rapid_scan_cities": ["hong_kong", "singapore", "tokyo", "seoul", "chengdu", "taipei", "shanghai"],
+  "rapid_scan_cities": ["hong_kong", "singapore", "tokyo", "seoul"],
   "rapid_scan_interval": 122,
   "rapid_start_utc": 1,
   "rapid_end_utc": 6,
-  "max_bucket_distance": 1.5,
+  "max_bucket_distance": 1.0,
   "max_conviction_trades": 3,
   "conviction_sizes": [8, 4, 3]
 }

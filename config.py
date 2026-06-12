@@ -67,6 +67,9 @@ POLYMARKET_PROXY_WALLET = os.getenv("POLYMARKET_PROXY_WALLET", "")
 BTC_LIVE_MODE   = os.getenv("BTC_LIVE_MODE", "false").lower() == "true"
 SOL_LIVE_MODE   = os.getenv("SOL_LIVE_MODE", "false").lower() == "true"
 ACTIVE_CITIES       = CFG["active_cities"]
+# Shadow cities: scanned and logged for calibration, never traded.
+# Promote to active_cities only after ~15 resolved shadow trades show edge.
+SHADOW_CITIES       = CFG.get("shadow_cities", [])
 LIVE_CITIES         = CFG.get("live_cities", CFG["active_cities"])
 RAPID_SCAN_CITIES   = CFG.get("rapid_scan_cities", ["hong_kong", "singapore", "tokyo", "seoul", "chengdu"])
 RAPID_SCAN_INTERVAL = CFG.get("rapid_scan_interval", 60)
