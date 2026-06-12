@@ -459,18 +459,24 @@ if __name__ == "__main__":
         btc15_mode = "LIVE" if _btc15_live   else "PAPER"
         sol_mode   = "LIVE" if _sol_live     else "PAPER"
         sol15_mode = "LIVE" if _sol15_live   else "PAPER"
-        log.info(f"WeatherBet Ultimate starting -- BTC-ONLY MODE (weather paused)")
+
+        # Weather scanner pause is env-driven: set WEATHER_PAUSED=true in .env
+        # for BTC-only mode. Default: weather scanning runs (paper mode).
+        WEATHER_PAUSED = os.getenv("WEATHER_PAUSED", "false").lower() == "true"
+
+        weather_mode = ("PAUSED" if WEATHER_PAUSED
+                        else ("PAPER" if PAPER_MODE else "LIVE"))
+        log.info(f"WeatherBet Ultimate starting -- weather: {weather_mode}")
         log.info(f"  BTC  5m : {btc_mode}  |  BTC 15m: {btc15_mode}  |  "
                  f"SOL  5m : {sol_mode}  |  SOL 15m: {sol15_mode}")
         send_alert(
             f"WeatherBot started\n"
+            f"Weather : {weather_mode}\n"
             f"BTC  5m : {btc_mode}\n"
-            f"BTC 15m : {btc15_mode}  ← LIVE $1/trade\n"
+            f"BTC 15m : {btc15_mode}\n"
             f"SOL  5m : {sol_mode}\n"
             f"SOL 15m : {sol15_mode}"
         )
-
-        WEATHER_PAUSED = True   # weather scanner paused — BTC only mode
 
         stopped     = False
         last_crypto = time.monotonic()   # global BTC cadence — never reset by weather cycle
