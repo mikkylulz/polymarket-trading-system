@@ -79,11 +79,15 @@ def send_alert(msg, priority="normal"):
         return
     emoji = "🚨" if priority == "high" else "📊"
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT, "text": f"{emoji} WEATHERBET\n{msg}"},
             timeout=8
         )
+        if r.status_code != 200:
+            # e.g. bad chat_id, bot blocked, message too long — was silent before
+            log.warning(f"Telegram rejected alert (HTTP {r.status_code}): "
+                        f"{r.text[:200]}")
     except Exception as e:
         log.warning(f"Telegram failed: {e}")
 

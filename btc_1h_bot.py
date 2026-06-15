@@ -47,6 +47,16 @@ TRADE_SIZE_USD         = 1.00
 SCAN_INTERVAL_SEC      = 60      # main.py calls run_1h_scan() every 60 s
 DEFAULT_VOL_PCT        = 0.45    # fallback hourly vol when history is thin (%)
 
+# ── Execution mode (maker-first vs taker) ────────────────────────────────────
+# Maker-first: rest a passive GTC limit order (post_only, zero fee) and let it
+# fill, instead of a FOK taker that crosses the spread and pays the platform's
+# highest fee on a thin edge. Live WR ran 51% vs 67% paper as a taker (adverse
+# selection); maker-first removes the fee + spread drag. Set False to revert to
+# the FOK taker path (_btc_1h_live_order) instantly.
+MAKER_FIRST                  = True
+MAKER_TICK                   = 0.01   # price tick on these markets
+MAKER_CANCEL_BEFORE_CLOSE_MIN = 5     # cancel an unfilled maker order this close to resolution
+
 # ── API endpoints ──────────────────────────────────────────────────────────────
 POLY_API       = "https://gamma-api.polymarket.com"
 COINGECKO_URL  = ("https://api.coingecko.com/api/v3/simple/price"
@@ -541,7 +551,10 @@ def _save_trades(trades: List[dict]):
 
 
 def _open_count() -> int:
-    return sum(1 for t in _load_trades() if t.get("status") == "open")
+    # "pending" = a resting maker order not yet filled; it still consumes a slot
+    # so we don't stack unlimited resting orders.
+    return sum(1 for t in _load_trades()
+               if t.get("status") in ("open", "pending"))
 
 
 def _daily_count() -> int:
@@ -623,14 +636,219 @@ def _resolve_trades(current_price: float):
         _save_trades(trades)
 
 
+def _open_from_fill(t: dict, st: dict, now_utc) -> None:
+    """Promote a filled (or partially filled) maker order to an open position."""
+    shares = st["matched_shares"]
+    px = round(st["price"] or t.get("entry_price", 0.5), 4)
+    t["entry_price"] = px
+    t["size"]        = round(shares * px, 2)     # USDC actually deployed
+    t["status"]      = "open"
+    t["opened_at"]   = now_utc.isoformat()        # use the fill time
+    msg = (f"1H LIVE FILLED (maker) | {t.get('direction')} "
+           f"{shares:.2f}sh @ {px:.2f}  ${t['size']:.2f}")
+    log.info(msg)
+    send_alert(msg, priority="high")
+
+
+def _reconcile_pending(current_price: float):
+    """Maker-first lifecycle, run each scan before new entries:
+      - promote filled resting orders to open positions
+      - cancel definitively-unfilled orders that are near close or whose edge
+        has gone, re-checking after cancel to catch a fill race
+    Never marks an order cancelled on an unreadable status (that could orphan a
+    live position) — it leaves it pending and retries, escalating if stuck."""
+    if not BTC_1H_LIVE_MODE:
+        return
+    trades = _load_trades()
+    if not any(t.get("status") == "pending" for t in trades):
+        return
+    now_utc = datetime.now(timezone.utc)
+    hourly_vol = _realized_hourly_vol()
+    changed = False
+    for t in trades:
+        if t.get("status") != "pending":
+            continue
+        oid = t.get("poly_order_id", "")
+        try:
+            close_ts = datetime.fromisoformat(
+                str(t.get("close_ts", "")).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            close_ts = None
+
+        st = _btc_1h_order_status(oid) if oid else None
+        if st is None:
+            # Status unreadable — do NOT drop it (it might be filled). Retry next
+            # scan; if it's stuck well past close, surface it for manual review.
+            if close_ts and now_utc > close_ts + timedelta(minutes=15):
+                send_alert(f"[1H MAKER] pending order {oid} unreadable 15min past "
+                           f"close — CHECK MANUALLY", priority="high")
+            continue
+
+        if st["matched_shares"] > 0:                 # filled (full or partial)
+            if oid:
+                _btc_1h_cancel(oid)                  # stop further fills; fix size
+            _open_from_fill(t, st, now_utc)
+            changed = True
+            continue
+
+        # Definitively unfilled — cancel only if near close or edge has gone.
+        mins_left = (close_ts - now_utc).total_seconds() / 60.0 if close_ts else -1
+        bid = t.get("entry_price", 0.0)
+        reason = None
+        if close_ts is None or mins_left <= MAKER_CANCEL_BEFORE_CLOSE_MIN:
+            reason = f"near close ({mins_left:.0f}min left)"
+        else:
+            fair_yes = _calc_fair_yes(current_price, t.get("strike_price", 0.0),
+                                      max(1.0, (close_ts - now_utc).total_seconds()),
+                                      hourly_vol)
+            fair_side = fair_yes if t.get("direction") == "YES" else 1.0 - fair_yes
+            if fair_side - bid < MIN_GAP:
+                reason = f"edge gone (fair {fair_side:.2f} vs bid {bid:.2f})"
+        if reason:
+            if oid:
+                _btc_1h_cancel(oid)
+            recheck = _btc_1h_order_status(oid) if oid else None
+            if recheck and recheck["matched_shares"] > 0:   # filled during the race
+                _open_from_fill(t, recheck, now_utc)
+            else:
+                t["status"]    = "cancelled"
+                t["closed_at"] = now_utc.isoformat()
+                log.info(f"[1H MAKER] cancelled {t.get('direction')} bid {bid:.2f} "
+                         f"— {reason}")
+            changed = True
+        # else: still valid — leave it resting
+    if changed:
+        _save_trades(trades)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Live order (Polymarket CLOB)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _clob_best_ask(token_id: str):
+    """Best ask from the live CLOB book — the price a BUY can actually execute
+    at right now. The Gamma outcomePrices mid is a stale snapshot; pricing FOK
+    orders off it fills disproportionately when the book just moved against the
+    thesis (the 15m bot's adverse-selection failure mode)."""
+    try:
+        r = requests.get("https://clob.polymarket.com/book",
+                         params={"token_id": token_id}, timeout=8)
+        r.raise_for_status()
+        asks = (r.json() or {}).get("asks") or []
+        if not asks:
+            return None
+        return min(float(a["price"]) for a in asks)
+    except Exception as e:
+        log.warning(f"[1H LIVE] Book fetch failed: {e}")
+        return None
+
+
+# ── Maker-first execution (cached client + limit/status/cancel) ─────────────────
+_clob_client = None
+
+
+def _get_clob():
+    """Cached py_clob_client_v2 client (creds derived once). Returns None on
+    failure. Reused across the scan because maker-first polls order status."""
+    global _clob_client
+    if _clob_client is not None:
+        return _clob_client
+    if not _PRIVATE_KEY:
+        log.warning("[1H LIVE] PRIVATE_KEY not set — cannot trade live")
+        return None
+    try:
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.constants import POLYGON
+        client = ClobClient("https://clob.polymarket.com", key=_PRIVATE_KEY,
+                            chain_id=POLYGON, signature_type=3, funder=_PROXY_WALLET)
+        logging.getLogger("py_clob_client_v2").setLevel(logging.CRITICAL)
+        client.set_api_creds(client.create_or_derive_api_key())
+        _clob_client = client
+        return client
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[1H LIVE] CLOB client init failed: {e}")
+        return None
+
+
+def _clob_book(token_id: str):
+    """(best_bid, best_ask) from the live CLOB book, or (None, None)."""
+    try:
+        r = requests.get("https://clob.polymarket.com/book",
+                         params={"token_id": token_id}, timeout=8)
+        r.raise_for_status()
+        b = r.json() or {}
+        bids = [float(x["price"]) for x in (b.get("bids") or [])]
+        asks = [float(x["price"]) for x in (b.get("asks") or [])]
+        return (max(bids) if bids else None, min(asks) if asks else None)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[1H LIVE] Book fetch failed: {e}")
+        return (None, None)
+
+
+def _btc_1h_maker_order(token_id: str, price: float, size_usd: float) -> str:
+    """Rest a passive GTC post_only limit BUY (maker, zero fee). post_only makes
+    the EXCHANGE reject the order if it would cross — a hard maker guarantee.
+    Returns the order id on success, "" otherwise (incl. post_only rejection)."""
+    client = _get_clob()
+    if client is None:
+        return ""
+    try:
+        from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
+        from py_clob_client_v2.order_builder.constants import BUY
+        px = round(price, 2)
+        shares = round(size_usd / px, 2) if px > 0 else 0.0
+        if shares <= 0:
+            return ""
+        args = OrderArgsV2(token_id=token_id, price=px, size=shares, side=BUY)
+        signed = client.create_order(args)
+        resp = client.post_order(signed, OrderType.GTC, post_only=True)
+        resp = resp or {}
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id") or ""
+        if resp.get("success") is False or not oid:
+            log.warning(f"[1H MAKER] post rejected @ {px:.2f}: {resp}")
+            return ""
+        log.info(f"[1H MAKER] resting BUY {shares:.2f} @ {px:.2f} (post_only) id={oid}")
+        return oid
+    except Exception as e:  # noqa: BLE001
+        # post_only crossing rejection lands here too — expected, not an error
+        log.info(f"[1H MAKER] order not posted @ {price:.2f}: {e}")
+        return ""
+
+
+def _btc_1h_order_status(order_id: str):
+    """Returns dict {matched_shares, price, live} or None if it can't be read."""
+    client = _get_clob()
+    if client is None:
+        return None
+    try:
+        o = client.get_order(order_id) or {}
+        return {
+            "matched_shares": float(o.get("size_matched", 0) or 0),
+            "price": float(o.get("price", 0) or 0),
+            "live": (o.get("status") or "").upper() in ("LIVE", "OPEN", ""),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[1H MAKER] status check failed for {order_id}: {e}")
+        return None
+
+
+def _btc_1h_cancel(order_id: str) -> bool:
+    client = _get_clob()
+    if client is None:
+        return False
+    try:
+        client.cancel_orders([order_id])
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[1H MAKER] cancel failed for {order_id}: {e}")
+        return False
+
+
 def _btc_1h_live_order(direction: str, market: dict,
                        price: float, size: float) -> str:
     """
-    Place a FOK limit order on Polymarket CLOB.
+    Place a FOK limit order on Polymarket CLOB. (Taker fallback — only used when
+    MAKER_FIRST is False.)
     direction: "YES" or "NO"
     Returns order_id string on success, "" on failure.
     """
@@ -638,30 +856,61 @@ def _btc_1h_live_order(direction: str, market: dict,
         log.warning("[1H LIVE] PRIVATE_KEY not set — cannot place order")
         return ""
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-        from py_clob_client.constants import POLYGON
+        # py_clob_client_v2: the only installed client whose order builder
+        # accepts signature_type=3 (POLY_1271). The old py_clob_client rejects
+        # type 3 with "Invalid order inputs". This mirrors the proven BTC/SOL
+        # live path in crypto_scanner.py (real FOK fills June 10–12).
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+        from py_clob_client_v2.constants import POLYGON
 
-        creds  = ApiCreds(api_key=_POLY_KEY, api_secret=_POLY_SECRET,
-                          api_passphrase=_POLY_PASSPHRASE)
         client = ClobClient("https://clob.polymarket.com", key=_PRIVATE_KEY,
-                            chain_id=POLYGON, creds=creds,
+                            chain_id=POLYGON,
                             signature_type=3, funder=_PROXY_WALLET)
-        client.set_api_creds(client.create_or_derive_api_creds())
+        logging.getLogger("py_clob_client_v2").setLevel(logging.CRITICAL)
+        client.set_api_creds(client.create_or_derive_api_key())
 
         token_id = market["yes_token_id"] if direction == "YES" else market["no_token_id"]
-        args     = OrderArgs(token_id=token_id, price=price,
-                             size=round(size / price, 4), side="BUY")
-        resp     = client.create_and_post_order(args, OrderType.FOK)
-        oid      = (resp or {}).get("orderID") or (resp or {}).get("id") or ""
-        if oid:
-            log.info(f"[1H LIVE] Order placed: {oid}")
-        else:
-            log.warning(f"[1H LIVE] Order response had no ID: {resp}")
-        return oid or ""
+        # Market order with amount = USDC to spend, rounded to 2 decimals.
+        # Limit orders compute maker = shares × price internally, which drifts
+        # past 2 decimals and the API rejects them (see crypto_scanner.py).
+        # `price` is the live book ask (already edge-checked), so only +1¢
+        # race tolerance — not the old +3¢ blind-spread cap.
+        price_r   = round(min(price + 0.01, 0.97), 4)
+        usdc_size = round(size, 2)
+        args = MarketOrderArgsV2(token_id=token_id, amount=usdc_size,
+                                 side="BUY", price=price_r,
+                                 order_type=OrderType.FOK)
+        signed = client.create_market_order(args)
+        resp   = client.post_order(signed, OrderType.FOK)
     except Exception as e:
+        err = str(e)
+        if "fully filled" in err or "FOK" in err:
+            log.info(f"[1H LIVE] FOK kill — not fillable at {price:.3f} "
+                     f"({err[:150]}) — trade skipped")
+            return ""
         log.error(f"[1H LIVE] Order placement failed: {e}")
+        send_alert(f"[1H LIVE] LIVE ORDER FAILED: {e}", priority="high")
         return ""
+
+    # post_order() does not raise on exchange-level rejection — inspect the response.
+    if not isinstance(resp, dict):
+        log.error(f"[1H LIVE] LIVE ORDER FAILED — unexpected response: {resp}")
+        send_alert(f"[1H LIVE] LIVE ORDER FAILED — unexpected response: {resp}",
+                   priority="high")
+        return ""
+    oid       = resp.get("orderID") or resp.get("id") or ""
+    error_msg = resp.get("errorMsg") or resp.get("error") or ""
+    if resp.get("success") is False or error_msg:
+        reason = error_msg or f"status={resp.get('status', '')}"
+        log.error(f"[1H LIVE] LIVE ORDER REJECTED — {reason} | resp={resp}")
+        send_alert(f"[1H LIVE] LIVE ORDER REJECTED\n{reason}", priority="high")
+        return ""
+    if oid:
+        log.info(f"[1H LIVE] Order placed: {oid}")
+    else:
+        log.warning(f"[1H LIVE] Order response had no ID (FOK unmatched?): {resp}")
+    return oid or ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -764,8 +1013,9 @@ def run_1h_scan(paper_test: bool = False):
 
     log.info(f"[1H BOT] BTC=${current_price:,.2f}  history={len(_1h_prices)} readings")
 
-    # Resolve settled trades
+    # Resolve settled trades, then reconcile resting maker orders (fill/cancel)
     _resolve_trades(current_price)
+    _reconcile_pending(current_price)
 
     # Gate checks
     today_str = datetime.now(timezone.utc).date().isoformat()
@@ -779,10 +1029,11 @@ def run_1h_scan(paper_test: bool = False):
 
     all_trades = _load_trades()
 
-    # token_ids with an open position — primary dedup guard (survives restarts)
+    # token_ids with an open OR pending (resting maker) order — dedup guard so we
+    # don't stack a second order on a market we're already working (survives restarts)
     open_token_ids: set = {
         t["token_id"] for t in all_trades
-        if t.get("status") == "open" and t.get("token_id")
+        if t.get("status") in ("open", "pending") and t.get("token_id")
     }
 
     # market_ids already entered today — one entry per market per UTC day
@@ -854,16 +1105,56 @@ def _enter_trade(result: dict):
 
     mode_tag    = "1H LIVE" if BTC_1H_LIVE_MODE else "1H PAPER"
     poly_order_id = ""
+    entry_status = "open"   # paper / FOK fill immediately; a maker order rests as "pending"
 
     if BTC_1H_LIVE_MODE:
-        market_stub = {
-            "yes_token_id": result["token_id"] if direction == "YES" else "",
-            "no_token_id":  result["token_id"] if direction == "NO"  else "",
-        }
-        poly_order_id = _btc_1h_live_order(direction, market_stub, entry_price, size)
-        if not poly_order_id:
-            log.warning("[1H LIVE] Order not confirmed — trade not recorded")
+        fair_side = result["fair_yes"] if direction == "YES" else 1.0 - result["fair_yes"]
+        best_bid, best_ask = _clob_book(result["token_id"])
+        if best_bid is None or best_ask is None:
+            log.warning("[1H LIVE] No book — trade skipped")
             return
+
+        if MAKER_FIRST:
+            # Rest a passive bid: improve the best bid by a tick, but never pay
+            # more than (fair - margin) and never cross the ask. post_only also
+            # enforces maker at the exchange — zero fee, no spread paid.
+            desired   = round(fair_side - MIN_GAP, 2)            # max price keeping the edge
+            maker_bid = round(min(round(best_bid + MAKER_TICK, 2), desired,
+                                  round(best_ask - MAKER_TICK, 2)), 2)
+            if maker_bid <= 0 or maker_bid >= best_ask:
+                log.info(f"[1H MAKER] no maker room (bid {best_bid} ask {best_ask}) — skipped")
+                return
+            if fair_side - maker_bid < MIN_GAP:
+                log.info(f"[1H MAKER] edge gone at maker bid {maker_bid:.2f} "
+                         f"(fair {fair_side:.3f}) — skipped")
+                return
+            if not (MIN_ENTRY_PRICE <= maker_bid <= MAX_ENTRY_PRICE):
+                log.info(f"[1H MAKER] maker bid {maker_bid:.2f} outside entry range — skipped")
+                return
+            poly_order_id = _btc_1h_maker_order(result["token_id"], maker_bid, size)
+            if not poly_order_id:
+                log.info("[1H MAKER] order not posted — trade skipped")
+                return
+            entry_price  = maker_bid
+            entry_status = "pending"   # fills asynchronously; _reconcile_pending promotes it
+        else:
+            # Taker fallback (FOK): re-check the executable ask before crossing.
+            ask = best_ask
+            if fair_side - ask < MIN_GAP:
+                log.info(f"[1H LIVE] Edge gone at ask {ask:.3f} — trade skipped")
+                return
+            if not (MIN_ENTRY_PRICE <= ask <= MAX_ENTRY_PRICE):
+                log.info(f"[1H LIVE] Ask {ask:.3f} outside entry range — skipped")
+                return
+            entry_price = ask
+            market_stub = {
+                "yes_token_id": result["token_id"] if direction == "YES" else "",
+                "no_token_id":  result["token_id"] if direction == "NO"  else "",
+            }
+            poly_order_id = _btc_1h_live_order(direction, market_stub, entry_price, size)
+            if not poly_order_id:
+                log.warning("[1H LIVE] Order not confirmed — trade not recorded")
+                return
 
     now       = datetime.now(timezone.utc).isoformat()
     trade_id  = f"btc1h_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -893,7 +1184,7 @@ def _enter_trade(result: dict):
         "market_title":   title,
         "token_id":       result["token_id"],
         "poly_order_id":  poly_order_id,
-        "status":         "open",
+        "status":         entry_status,
         "won":            None,
         "pnl":            None,
     }
@@ -902,8 +1193,11 @@ def _enter_trade(result: dict):
     trades.append(trade)
     _save_trades(trades)
 
+    head = (f"{mode_tag} POSTED (maker resting) | {direction} bid {entry_price:.2f}"
+            if entry_status == "pending"
+            else f"{mode_tag} OPEN | {direction} @ ${result['btc_entry']:,.0f}")
     msg = (
-        f"{mode_tag} OPEN | {direction} @ ${result['btc_entry']:,.0f}\n"
+        f"{head}\n"
         f"  Market: {title}\n"
         f"  Entry: {entry_price:.3f}  Strike: ${result['strike_price']:,.2f}\n"
         f"  Fair YES: {result['fair_yes']:.4f}  Market YES: {result['yes_price']:.3f}  "
@@ -1062,6 +1356,10 @@ def run_1h_bot_loop(paper_test: bool = False):
     """
     mode = "PAPER-TEST" if paper_test else ("LIVE" if BTC_1H_LIVE_MODE else "PAPER")
     log.info(f"[1H BOT] Starting — mode={mode}  interval={SCAN_INTERVAL_SEC}s")
+    if not paper_test:
+        send_alert(f"[1H BOT] Started — mode={mode}, scan every "
+                   f"{SCAN_INTERVAL_SEC}s. Alerts fire on: trade open, "
+                   f"resolution, live-order failure.")
 
     if paper_test:
         run_1h_paper_test()
