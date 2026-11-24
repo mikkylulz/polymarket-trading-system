@@ -3,14 +3,14 @@ funding_diagnostic.py
 Polls Gate.io for BTC_USDT and SOL_USDT funding rates every 5 minutes for 2 hours.
 Saves each reading to data/funding_diagnostic.json and prints a final analysis.
 
-Run:  python funding_diagnostic.py
+Run:  python scripts/funding_diagnostic.py
 """
 import json, math, os, statistics, time
 from datetime import datetime, timezone
 
 import requests
 
-OUT = os.path.join(os.path.dirname(__file__), "data", "funding_diagnostic.json")
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "funding_diagnostic.json")
 GATE_URL = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
 CONTRACTS = ["BTC_USDT", "SOL_USDT"]
 INTERVAL  = 300   # 5 minutes
