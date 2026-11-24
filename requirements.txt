@@ -1,0 +1,8 @@
+requests>=2.31
+python-dotenv>=1.0
+
+# Tests
+pytest>=8.0
+
+# Live trading only (not needed for paper mode or tests). Imported lazily.
+# py-clob-client-v2>=1.0.1

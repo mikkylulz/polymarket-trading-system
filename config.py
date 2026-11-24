@@ -27,16 +27,22 @@ BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
 
 # ── Credential validation ─────────────────────────────────────
-_REQUIRED_ENV = [
+CFG  = json.loads((BASE / "config.json").read_text())
+
+# Telegram and Visual Crossing are optional in paper mode: alerts fall back to
+# the log and the Visual Crossing cross-check is skipped. Live mode requires them.
+_ALERT_ENV = [
     "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "VC_API_KEY",
 ]
-_missing = [v for v in _REQUIRED_ENV if not os.getenv(v)]
+_missing = [v for v in _ALERT_ENV if not os.getenv(v)]
 if _missing:
-    for _v in _missing:
-        logging.getLogger("weatherbet").error(f"Missing required .env variable: {_v}")
-    sys.exit(1)
-
-CFG  = json.loads((BASE / "config.json").read_text())
+    if CFG.get("paper_mode", True):
+        logging.getLogger("weatherbet").warning(
+            "Paper mode without %s: alerts go to the log only", ", ".join(_missing))
+    else:
+        for _v in _missing:
+            logging.getLogger("weatherbet").error(f"Missing required .env variable: {_v}")
+        sys.exit(1)
 
 BALANCE        = CFG["balance"]
 MAX_BET        = CFG["max_bet"]

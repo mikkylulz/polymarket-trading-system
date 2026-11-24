@@ -19,3 +19,14 @@ __pycache__/
 # Editor
 .vscode/
 *.swp
+.env.*
+!.env.example
+
+# Python tooling
+.venv/
+venv/
+.pytest_cache/
+*.db
+*.sqlite
+*.csv
+logs/
