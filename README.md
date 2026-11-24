@@ -1,5 +1,7 @@
 # polymarket-trading-system
 
+**Status: no longer developed. Superseded by [Btc_trading_bot](https://github.com/mikkylulz/Btc_trading_bot).**
+
 > **Disclaimer.** This is an educational and research project. It is not financial advice.
 > Prediction markets and crypto are risky and you can lose all of the money you put in.
 > Use this code at your own risk. The results below include real losses.
@@ -159,10 +161,18 @@ this codebase reads Chainlink. Finding this was one of the main reasons for the 
 which routes every market to the feed it really settles on and grades every trade off
 Polymarket's own resolution.
 
+### BTC 1h: ties went the wrong way
+
+Polymarket's 1h rules settle an exact tie (close equal to the hourly open) as UP. The 1h
+bot used a strict `>`, so its fair value at the close and its fallback trade grading both
+treated a tie as DOWN. Rare, but it is the same class of bug: not matching the exact
+resolution rule. Both now use `>=`, and a test covers the tie case.
+
 ## Lessons learned
 
 - **Price and grade against the exact resolution source.** For weather that is a specific
-  airport station. For crypto it is a specific oracle feed. Close enough is not enough.
+  airport station. For crypto it is a specific oracle feed, and even the tie rule matters.
+  Close enough is not enough.
 - **Paper results are only as honest as the grading.** Two separate grading bugs made
   paper look profitable while live lost money.
 - **Calibrate before trading, and make new markets earn their way in.** Shadow mode costs
@@ -232,10 +242,11 @@ repo root, for example `python scripts/diag_15m.py`. They read trade files under
 pytest
 ```
 
-29 tests cover the pure maths: bucket label parsing and Fahrenheit conversion, bucket
+30 tests cover the pure maths: bucket label parsing and Fahrenheit conversion, bucket
 probability (centring, distance, clamping, the no-forecast prior), EV, fractional Kelly
 sizing and caps, sigma selection, the normal CDF, and the BTC 1h fair-value model
-(symmetry, time decay, clamping, settled windows). They run offline in under a second.
+(symmetry, time decay, clamping, settled windows, ties resolving UP).
+They run offline in under a second.
 
 ## Project layout
 

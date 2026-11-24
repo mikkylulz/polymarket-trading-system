@@ -36,6 +36,13 @@ def test_fair_value_after_close_is_decided():
     assert _calc_fair_yes(59_900, 60_000, 0, 0.5) == 0.0
 
 
+def test_exact_tie_at_close_counts_as_up():
+    # Polymarket's 1h rules settle close == open as UP.
+    assert _calc_fair_yes(60_000, 60_000, 0, 0.5) == 1.0
+    # Same rule when remaining volatility rounds to zero just before the close.
+    assert _calc_fair_yes(60_000, 60_000, 0.001, 0.5) == 1.0
+
+
 def test_parse_prices():
     assert _parse_prices('["0.42", "0.58"]') == [0.42, 0.58]
     assert _parse_prices([0.1, "0.9"]) == [0.1, 0.9]

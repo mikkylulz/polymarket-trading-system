@@ -124,7 +124,8 @@ def _calc_fair_yes(current_price: float,
                    remaining_sec: float,
                    hourly_vol_pct: float) -> float:
     """
-    P(BTC_close > strike_price) using a simplified GBM/diffusion model.
+    P(BTC_close >= strike_price) using a simplified GBM/diffusion model.
+    Polymarket's 1h rules settle an exact tie as UP, so ties count as YES.
 
     remaining_vol = hourly_vol * sqrt(remaining_hours)
     z_score       = price_delta_pct / remaining_vol
@@ -133,13 +134,13 @@ def _calc_fair_yes(current_price: float,
     Clamped to [0.05, 0.95] so the model is never fully certain.
     """
     if remaining_sec <= 0 or hourly_vol_pct <= 0:
-        return 1.0 if current_price > strike_price else 0.0
+        return 1.0 if current_price >= strike_price else 0.0
 
     remaining_hours = remaining_sec / 3600.0
     remaining_vol   = hourly_vol_pct * math.sqrt(remaining_hours)
 
     if remaining_vol < 0.001:
-        return 1.0 if current_price > strike_price else 0.0
+        return 1.0 if current_price >= strike_price else 0.0
 
     price_delta_pct = (current_price - strike_price) / strike_price * 100.0
     z_score         = price_delta_pct / remaining_vol
@@ -569,8 +570,8 @@ def _resolve_trades(current_price: float):
     """
     Close any open 1h trades whose close_ts has passed.
     Resolution: BTC current price vs strike price.
-      YES wins if current_price > strike_price
-      NO  wins if current_price <= strike_price
+      YES wins if current_price >= strike_price (ties resolve UP)
+      NO  wins if current_price <  strike_price
     """
     trades  = _load_trades()
     now_utc = datetime.now(timezone.utc)
@@ -609,9 +610,9 @@ def _resolve_trades(current_price: float):
                     continue
                 log.warning("[1H LIVE] Oracle unavailable 10 min after close — "
                             "falling back to Binance strike comparison")
-                won = (current_price > strike) if direction == "YES" else (current_price <= strike)
+                won = (current_price >= strike) if direction == "YES" else (current_price < strike)
         else:
-            won = (current_price > strike) if direction == "YES" else (current_price <= strike)
+            won = (current_price >= strike) if direction == "YES" else (current_price < strike)
         entry     = t.get("entry_price", 0.5)
         size      = t.get("size", TRADE_SIZE_USD)
         pnl       = round(size * (1.0 / entry - 1) if won else -size, 2)
